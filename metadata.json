@@ -1,0 +1,8 @@
+{
+  "name": "NetBird for GNOME",
+  "description": "NetBird integrated into the GNOME desktop",
+  "uuid": "gnome@netbird.io",
+  "shell-version": [
+    "47"
+  ]
+}
