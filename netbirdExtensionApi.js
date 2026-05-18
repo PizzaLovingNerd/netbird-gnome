@@ -1,3 +1,5 @@
+import GLib from 'gi://GLib';
+
 import {NetBirdProfileClient} from './netbirdProfiles.js';
 
 
@@ -8,19 +10,19 @@ export async function loadNetBirdProfiles({
     cancellable = null,
     socketPath = null,
     timeoutMs = DEFAULT_TIMEOUT_MS,
+    username = getCurrentUsername(),
 } = {}) {
     const client = createProfileClient({socketPath, timeoutMs});
-    const activeProfile = await client.getActiveProfileAsync({cancellable, timeoutMs});
-    const profiles = await client.listProfilesAsync(activeProfile.username, {
-        cancellable,
-        timeoutMs,
-    });
+    return (await client.getProfilesAsync(username, {cancellable, timeoutMs})).profiles;
+}
 
-    return profiles.map(profile => ({
-        ...profile,
-        selected: profile.selected || profile.name === activeProfile.profileName,
-        username: activeProfile.username,
-    }));
+export async function getActiveNetBirdProfile({
+    cancellable = null,
+    socketPath = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+    const client = createProfileClient({socketPath, timeoutMs});
+    return await client.getActiveProfileAsync({cancellable, timeoutMs});
 }
 
 export async function switchNetBirdProfile(profileName, {
@@ -53,9 +55,51 @@ export async function disconnectNetBird({
     await client.downAsync({cancellable, timeoutMs});
 }
 
+export async function getNetBirdStatus({
+    cancellable = null,
+    socketPath = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    waitForReady = false,
+} = {}) {
+    const client = createProfileClient({socketPath, timeoutMs});
+    return await client.statusAsync({cancellable, timeoutMs, waitForReady});
+}
+
+export async function loginNetBird({
+    cancellable = null,
+    hostname = undefined,
+    profileName = '',
+    socketPath = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    username = getCurrentUsername(),
+} = {}) {
+    const client = createProfileClient({socketPath, timeoutMs});
+    return await client.loginAsync({
+        cancellable,
+        hostname,
+        profileName,
+        timeoutMs,
+        username,
+    });
+}
+
+export async function waitForNetBirdLogin(userCode, {
+    cancellable = null,
+    hostname = undefined,
+    socketPath = null,
+    timeoutMs = undefined,
+} = {}) {
+    const client = createProfileClient({socketPath, timeoutMs});
+    return await client.waitSSOLoginAsync(userCode, {cancellable, hostname, timeoutMs});
+}
+
 function createProfileClient({socketPath, timeoutMs}) {
     return new NetBirdProfileClient({
         socketPath,
         timeoutMs,
     });
+}
+
+export function getCurrentUsername() {
+    return GLib.get_user_name();
 }

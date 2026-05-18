@@ -65,9 +65,18 @@ export class NetBirdGrpcClient {
         cancellable = null,
         timeoutMs = DEFAULT_TIMEOUT_MS,
     } = {}) {
-        const operationCancellable = cancellable ?? new Gio.Cancellable();
+        const operationCancellable = new Gio.Cancellable();
+        let cancellableSignalId = 0;
         let timedOut = false;
         let timeoutId = 0;
+
+        if (cancellable?.is_cancelled()) {
+            operationCancellable.cancel();
+        } else if (cancellable) {
+            cancellableSignalId = cancellable.connect(() => {
+                operationCancellable.cancel();
+            });
+        }
 
         if (timeoutMs > 0) {
             timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, timeoutMs, () => {
@@ -92,6 +101,9 @@ export class NetBirdGrpcClient {
         } finally {
             if (timeoutId)
                 GLib.source_remove(timeoutId);
+
+            if (cancellableSignalId)
+                cancellable.disconnect(cancellableSignalId);
         }
     }
 
