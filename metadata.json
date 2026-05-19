@@ -1,6 +1,6 @@
 {
   "name": "NetBird for GNOME",
-  "description": "NetBird integrated into the GNOME desktop",
+  "description": "NetBird quick setting for GNOME",
   "uuid": "gnome@netbird.io",
   "shell-version": [
     "47"

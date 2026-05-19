@@ -23,85 +23,109 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
+import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 import {
-    connectNetBird,
-    disconnectNetBird,
-    getActiveNetBirdProfile,
-    getCurrentUsername,
-    getNetBirdStatus,
-    loadNetBirdProfiles,
-    loginNetBird,
-    switchNetBirdProfile,
-    waitForNetBirdLogin,
-} from './netbirdExtensionApi.js';
+    netbird_down,
+    netbird_profile_list,
+    netbird_profile_select,
+    netbird_status,
+    netbird_up,
+} from './api/index.js';
 
-
-const NETBIRD_STATUS_POLL_SECONDS = 5;
-const NETBIRD_UP_STATUSES = new Set(['Connecting', 'Connected']);
+const NETBIRD_COMMAND_TIMEOUT_MS = 30000;
+const NETBIRD_QUERY_TIMEOUT_MS = 5000;
+const NETBIRD_ERROR_NOTIFY_THROTTLE_US = 30000000;
 const NETBIRD_VPN_TOGGLE_NAMES = /\b(netbird|wiretrustee|wt0)\b/i;
-const NETBIRD_DISCONNECT_FAILURE_SUPPRESS_MS = 10000;
-const NETBIRD_PROFILE_TIMEOUT_MS = 15000;
-const NETBIRD_CONNECT_TIMEOUT_MS = 65000;
-const NETBIRD_LOGIN_TIMEOUT_MS = 90000;
-const NETBIRD_DEFAULT_PROFILE = 'default';
-const NETBIRD_PROFILE_RELOAD_RETRY_MS = 1500;
+
+
+function formatErrorMessage(error) {
+    const output = [
+        error?.message,
+        error?.stdout,
+        error?.stderr,
+    ].filter(Boolean).join('\n').trim();
+
+    if (!output)
+        return String(error);
+
+    const firstUsefulLine = output
+        .split('\n')
+        .map(line => line.trim())
+        .find(line => line && !line.includes('caller_not_available')) ?? output;
+
+    return firstUsefulLine.length > 240
+        ? `${firstUsefulLine.slice(0, 237)}...`
+        : firstUsefulLine;
+}
 
 
 const NetBirdToggle = GObject.registerClass(
 class NetBirdToggle extends QuickMenuToggle {
     constructor(gicon, indicator) {
         super({
-            title: _('NetBird'),
+            title: 'NetBird',
+            subtitle: '',
             gicon,
-            toggleMode: true,
+            toggleMode: false,
         });
 
-        this._gicon = gicon;
         this._indicator = indicator;
         this._profileItems = [];
-        this._profileListCancellable = new Gio.Cancellable();
-        this._profileLoadInProgress = false;
-        this._profileSwitchInProgress = false;
-        this._profileReloadRetryId = 0;
-        this._username = getCurrentUsername();
+        this._selectedProfileName = '';
+        this._cancellable = new Gio.Cancellable();
         this._destroyed = false;
-        this._vpnToggle = null;
-        this._vpnIndicator = null;
-        this._networkIndicator = null;
-        this._statusCancellable = new Gio.Cancellable();
-        this._statusPollId = 0;
-        this._statusRefreshInProgress = false;
+        this._hasError = false;
+        this._loadingProfiles = false;
         this._settingCheckedFromStatus = false;
         this._toggleCommandInProgress = false;
-        this._lastStatus = '';
+        this._statusRefreshInProgress = false;
+        this._lastConnectedStatus = false;
+        this._quickSettingsMenu = Main.panel.statusArea.quickSettings.menu;
+        this._quickSettingsMenuSignalId = 0;
+        this._vpnToggle = null;
         this._vpnToggleSignalIds = [];
         this._vpnToggleHiddenByNetBird = false;
-        this._vpnIndicatorPatched = false;
-        this._originalNetworkActivationFailed = null;
-        this._suppressNetworkActivationFailedUntil = 0;
+        this._lastErrorNotificationUs = 0;
 
-        // Use GNOME Shell's built-in quick settings header so NetBird matches
-        // system menus such as Power Mode.
-        this.menu.setHeader(gicon, _('NetBird'));
+        this.menu.setHeader(gicon, 'NetBird');
 
-        this._addProfileStatusItem(_('Loading profiles...'));
-        this._loadProfiles();
+        this._addProfileStatusItem('Loading profiles...');
 
-        this._separator = new PopupMenu.PopupSeparatorMenuItem();
-        this.menu.addMenuItem(this._separator);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._addAdvancedSettingsItem();
 
-        this.connect('notify::checked', () => this._onCheckedChanged());
-        this._refreshStatus();
-        this._statusPollId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT,
-            NETBIRD_STATUS_POLL_SECONDS,
-            () => {
-                this._refreshStatus();
-                return GLib.SOURCE_CONTINUE;
-            });
+        this.connect('clicked', () => this._onToggleClicked());
+        this._quickSettingsMenuSignalId = this._quickSettingsMenu.connect(
+            'open-state-changed',
+            (_menu, isOpen) => this._onQuickSettingsOpenStateChanged(isOpen));
+        this._watchVpnQuickSetting();
+
+        this._loadProfiles();
+
+        if (this._quickSettingsMenu.isOpen)
+            this._refreshStatus();
+    }
+
+    _addProfileItem(profileName) {
+        const item = new PopupMenu.PopupMenuItem(profileName);
+        item._profileName = profileName;
+        item.label.x_expand = true;
+
+        item._checkIcon = new St.Icon({
+            icon_name: 'object-select-symbolic',
+            style_class: 'popup-menu-icon',
+            visible: false,
+        });
+        item.add_child(item._checkIcon);
+
+        item.connect('activate', () => {
+            this._selectProfile(profileName, item);
+        });
+
+        this._profileItems.push(item);
+        this.menu.addMenuItem(item, this._profileItems.length);
+
     }
 
     _addProfileStatusItem(label) {
@@ -111,33 +135,9 @@ class NetBirdToggle extends QuickMenuToggle {
             reactive: false,
             can_focus: false,
         });
+
         this._profileItems.push(item);
         this.menu.addMenuItem(item, 1);
-    }
-
-    _addProfileItem(profile, selected = false, position = -1) {
-        const item = new PopupMenu.PopupMenuItem(profile.name);
-        item.label.x_expand = true;
-
-        // Keep the selected profile mark on the right, matching the user's
-        // requested layout instead of PopupMenu's default left-side ornament.
-        item._checkIcon = new St.Icon({
-            icon_name: 'object-select-symbolic',
-            style_class: 'popup-menu-icon',
-            visible: false,
-        });
-        item.add_child(item._checkIcon);
-
-        item.connect('activate', () => {
-            this._switchProfile(profile, item);
-        });
-        this._profileItems.push(item);
-        this.menu.addMenuItem(item, position);
-
-        if (selected) {
-            this.subtitle = profile.name;
-            this._selectProfileItem(item);
-        }
     }
 
     _selectProfileItem(selectedItem) {
@@ -155,311 +155,236 @@ class NetBirdToggle extends QuickMenuToggle {
     }
 
     async _loadProfiles() {
-        if (this._destroyed || this._profileLoadInProgress)
+        if (this._destroyed || this._loadingProfiles)
             return;
 
-        if (this._profileListCancellable.is_cancelled())
-            this._profileListCancellable = new Gio.Cancellable();
-
-        this._profileLoadInProgress = true;
+        this._loadingProfiles = true;
 
         try {
-            const profiles = await loadNetBirdProfiles({
-                cancellable: this._profileListCancellable,
-                timeoutMs: NETBIRD_PROFILE_TIMEOUT_MS,
-                username: this._username,
+            const {profiles} = await netbird_profile_list({
+                cancellable: this._cancellable,
+                timeoutMs: NETBIRD_QUERY_TIMEOUT_MS,
             });
 
-            if (!this._destroyed)
-                this._setProfiles(profiles);
+            if (this._destroyed)
+                return;
+
+            this._clearErrorState();
+            this._clearProfileItems();
+
+            if (profiles.length === 0) {
+                this._addProfileStatusItem('No profiles found');
+                return;
+            }
+
+            profiles.forEach(profile => {
+                this._addProfileItem(profile.name);
+            });
+
+            this._selectProfileName(this._selectedProfileName);
         } catch (error) {
-            if (!this._profileListCancellable.is_cancelled()) {
-                console.warn(`Failed to load NetBird profiles: ${error}`);
-                this._addProfileStatusItem(_('Unable to load profiles'));
+            if (!this._cancellable.is_cancelled()) {
+                this._setErrorState();
+                this._notifyCliError('Failed to load NetBird profiles', error);
+                this._addProfileStatusItem('Unable to load profiles');
             }
         } finally {
-            this._profileLoadInProgress = false;
-
-            if (!this._destroyed && this._profileListCancellable.is_cancelled())
-                this._profileListCancellable = new Gio.Cancellable();
+            this._loadingProfiles = false;
         }
     }
 
-    _setProfiles(profiles) {
-        this._clearProfileItems();
-
-        if (profiles.length === 0) {
-            this._addProfileStatusItem(_('No profiles found'));
-            return;
-        }
-
-        profiles.forEach((profile, index) => {
-            this._addProfileItem(profile, profile.selected, index + 1);
-        });
-    }
-
-    async _switchProfile(profile, item) {
-        if (this._destroyed || this._profileSwitchInProgress ||
-            this._toggleCommandInProgress || profile.selected)
+    async _selectProfile(profileName, item) {
+        if (this._destroyed || this._toggleCommandInProgress)
             return;
 
-        this._profileSwitchInProgress = true;
-        this._toggleCommandInProgress = true;
-        const wasEnabled = this.checked || NETBIRD_UP_STATUSES.has(this._lastStatus);
-        this.subtitle = profile.name;
+        this.subtitle = 'Switching profile...';
+        this._setCheckedFromStatus(false);
+        this._syncVpnQuickSetting();
         this._selectProfileItem(item);
+        this._toggleCommandInProgress = true;
 
         try {
-            await switchNetBirdProfile(profile.name, {
-                cancellable: this._profileListCancellable,
-                timeoutMs: NETBIRD_PROFILE_TIMEOUT_MS,
-                username: this._profileUsername(profile),
+            await netbird_profile_select(profileName, {
+                cancellable: this._cancellable,
+                timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
             });
 
-            const status = await getNetBirdStatus({
-                cancellable: this._statusCancellable,
-                timeoutMs: NETBIRD_PROFILE_TIMEOUT_MS,
-                waitForReady: true,
-            });
-
-            if (NETBIRD_UP_STATUSES.has(status.status)) {
-                this._suppressNetworkActivationFailed();
-                await disconnectNetBird({
-                    cancellable: this._statusCancellable,
-                    timeoutMs: NETBIRD_CONNECT_TIMEOUT_MS,
-                });
-            }
-
-            if (wasEnabled)
-                await this._connectProfile(profile);
+            this._clearErrorState();
         } catch (error) {
-            if (!this._profileListCancellable.is_cancelled()) {
-                console.warn(`Failed to switch NetBird profile: ${error}`);
-                Main.notify(_('NetBird'), error.message ?? String(error));
+            if (!this._cancellable.is_cancelled()) {
+                this._setErrorState();
+                this._notifyCliError('Failed to select NetBird profile', error);
+                this._loadProfiles();
             }
         } finally {
-            this._profileSwitchInProgress = false;
             this._toggleCommandInProgress = false;
-            this._scheduleProfileReload();
             this._refreshStatus();
         }
     }
 
-    _profileUsername(profile) {
-        // NetBird's built-in default profile is not tied to the previous
-        // account username; passing one can leave the daemon in a bad state.
-        if (profile.name === NETBIRD_DEFAULT_PROFILE)
-            return '';
-
-        return profile.username || this._username;
-    }
-
-    _scheduleProfileReload() {
-        this._loadProfiles();
-
-        if (this._profileReloadRetryId)
-            GLib.source_remove(this._profileReloadRetryId);
-
-        this._profileReloadRetryId = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT,
-            NETBIRD_PROFILE_RELOAD_RETRY_MS,
-            () => {
-                this._profileReloadRetryId = 0;
-                this._loadProfiles();
-                return GLib.SOURCE_REMOVE;
-            });
-    }
-
-    _onCheckedChanged() {
-        this._syncVpnQuickSetting();
-
-        if (this._settingCheckedFromStatus)
-            return;
-
-        this._setNetBirdEnabled(this.checked);
-    }
-
-    async _setNetBirdEnabled(enabled) {
+    async _onToggleClicked() {
         if (this._toggleCommandInProgress)
             return;
 
+        const requestedChecked = !this.checked;
+        this.subtitle = requestedChecked ? 'Connecting...' : 'Disconnecting...';
         this._toggleCommandInProgress = true;
-        this._syncVpnQuickSetting();
 
         try {
-            if (enabled) {
-                await this._connectActiveProfile();
+            if (requestedChecked) {
+                await netbird_up({
+                    cancellable: this._cancellable,
+                    onLoginUrlOpen: () => this._notifyBrowserLogin(),
+                    profileName: this._selectedProfileName,
+                    timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
+                });
             } else {
-                this._suppressNetworkActivationFailed();
-                await disconnectNetBird({
-                    cancellable: this._statusCancellable,
-                    timeoutMs: NETBIRD_CONNECT_TIMEOUT_MS,
+                await netbird_down({
+                    cancellable: this._cancellable,
+                    timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
                 });
             }
+
+            this._clearErrorState();
         } catch (error) {
-            if (!this._statusCancellable.is_cancelled()) {
-                console.warn(`Failed to ${enabled ? 'start' : 'stop'} NetBird: ${error}`);
-                Main.notify(_('NetBird'), error.message ?? String(error));
+            if (!this._cancellable.is_cancelled()) {
+                this._setErrorState();
+                this._notifyCliError('Failed to change NetBird status', error);
             }
         } finally {
-            if (!enabled)
-                this._suppressNetworkActivationFailed();
-
             this._toggleCommandInProgress = false;
             this._refreshStatus();
-            this._syncVpnQuickSetting();
         }
-    }
-
-    async _connectActiveProfile() {
-        const activeProfile = await getActiveNetBirdProfile({
-            cancellable: this._statusCancellable,
-            timeoutMs: NETBIRD_PROFILE_TIMEOUT_MS,
-        });
-
-        await this._connectProfile({
-            name: activeProfile.profileName || NETBIRD_DEFAULT_PROFILE,
-            username: activeProfile.username,
-        });
-    }
-
-    async _connectProfile(profile) {
-        const profileName = profile.name || NETBIRD_DEFAULT_PROFILE;
-        const username = this._profileUsername({
-            name: profileName,
-            username: profile.username,
-        });
-        try {
-            const status = await getNetBirdStatus({
-                cancellable: this._statusCancellable,
-                timeoutMs: NETBIRD_PROFILE_TIMEOUT_MS,
-                waitForReady: true,
-            });
-
-            if (NETBIRD_UP_STATUSES.has(status.status))
-                return;
-        } catch (error) {
-            if (!this._statusCancellable.is_cancelled())
-                console.warn(`Failed to read NetBird status before connect: ${error}`);
-        }
-
-        const login = await loginNetBird({
-            cancellable: this._statusCancellable,
-            profileName,
-            timeoutMs: NETBIRD_LOGIN_TIMEOUT_MS,
-            username,
-        });
-
-        if (login.needsSSOLogin) {
-            const uri = login.verificationURIComplete || login.verificationURI;
-            if (uri) {
-                Gio.AppInfo.launch_default_for_uri(
-                    uri,
-                    global.create_app_launch_context(0, -1));
-            }
-
-            Main.notify(
-                _('Sign in to NetBird'),
-                login.userCode
-                    ? `${_('Complete sign-in in your browser. Code:')} ${login.userCode}`
-                    : _('Complete sign-in in your browser.'));
-
-            await waitForNetBirdLogin(login.userCode, {
-                cancellable: this._statusCancellable,
-            });
-        }
-
-        await connectNetBird({
-            cancellable: this._statusCancellable,
-            profileName,
-            timeoutMs: NETBIRD_CONNECT_TIMEOUT_MS,
-            username,
-        });
     }
 
     async _refreshStatus() {
-        if (this._statusRefreshInProgress || this._toggleCommandInProgress)
+        if (this._destroyed || this._toggleCommandInProgress || this._statusRefreshInProgress)
             return;
 
         this._statusRefreshInProgress = true;
 
         try {
-            const status = await getNetBirdStatus({cancellable: this._statusCancellable});
-            this._lastStatus = status.status;
-            this._setCheckedFromStatus(NETBIRD_UP_STATUSES.has(status.status));
-            this._syncVpnQuickSetting();
+            const status = await netbird_status({
+                cancellable: this._cancellable,
+                timeoutMs: NETBIRD_QUERY_TIMEOUT_MS,
+            });
+
+            if (!this._destroyed && !this._toggleCommandInProgress) {
+                this._clearErrorState();
+                this._syncFromStatus(status);
+            }
         } catch (error) {
-            if (!this._statusCancellable.is_cancelled())
-                console.warn(`Failed to refresh NetBird status: ${error}`);
+            if (!this._cancellable.is_cancelled()) {
+                this._setErrorState();
+                this._notifyCliError('Failed to refresh NetBird status', error);
+            }
         } finally {
             this._statusRefreshInProgress = false;
         }
     }
 
-    _setCheckedFromStatus(checked) {
-        if (this.checked === checked)
+    _onQuickSettingsOpenStateChanged(isOpen) {
+        if (!isOpen)
             return;
 
-        // Status polling mirrors CLI changes in the UI; it should not send a
-        // second up/down command back to the daemon.
-        this._settingCheckedFromStatus = true;
-        this.checked = checked;
-        this._settingCheckedFromStatus = false;
+        this._watchVpnQuickSetting();
+        this._refreshStatus();
     }
 
-    // NetBird owns its own tile. Reuse GNOME's VPN status indicator while active
-    // and hide the generic VPN tile so NetworkManager's switch cannot fight the
-    // daemon.
-    _syncVpnQuickSetting() {
-        const netBirdActive = this.checked ||
-            this._toggleCommandInProgress ||
-            NETBIRD_UP_STATUSES.has(this._lastStatus);
-        const networkIndicator = Main.panel.statusArea.quickSettings?._network;
-        this._installNetworkActivationFailureFilter(networkIndicator);
-
-        const vpnToggle = networkIndicator?._vpnToggle;
-        if (!vpnToggle) {
-            this._restoreVpnStatusIcon();
-            this._indicator.visible = this.checked;
+    _watchVpnQuickSetting() {
+        const vpnToggle = Main.panel.statusArea.quickSettings?._network?._vpnToggle ?? null;
+        if (this._vpnToggle === vpnToggle)
             return;
-        }
 
-        if (this._vpnToggle !== vpnToggle)
-            this._setVpnQuickSetting(vpnToggle);
+        this._unwatchVpnQuickSetting();
 
-        const shouldHide = netBirdActive ||
-            this._vpnToggleLooksLikeNetBird(vpnToggle);
+        if (!vpnToggle)
+            return;
 
-        this._syncVpnStatusIcon(netBirdActive);
-
-        if (shouldHide) {
-            this._vpnToggleHiddenByNetBird = true;
-            if (vpnToggle.visible)
-                vpnToggle.visible = false;
-        } else if (this._vpnToggleHiddenByNetBird) {
-            this._vpnToggleHiddenByNetBird = false;
-            vpnToggle.visible = true;
-        }
-    }
-
-    _setVpnQuickSetting(vpnToggle) {
-        this._restoreVpnQuickSetting();
         this._vpnToggle = vpnToggle;
-
         this._vpnToggleSignalIds = [
+            vpnToggle.connect('notify::checked', () => this._refreshStatus()),
             vpnToggle.connect('notify::visible', () => this._syncVpnQuickSetting()),
             vpnToggle.connect('notify::subtitle', () => this._syncVpnQuickSetting()),
             vpnToggle.connect('notify::icon-name', () => this._syncVpnQuickSetting()),
-            vpnToggle.connect('notify::checked', () => this._syncVpnQuickSetting()),
         ];
     }
 
-    _disconnectVpnQuickSettingSignals() {
+    _unwatchVpnQuickSetting() {
         if (!this._vpnToggle)
             return;
 
         this._vpnToggleSignalIds.forEach(id => this._vpnToggle.disconnect(id));
+        if (this._vpnToggleHiddenByNetBird)
+            this._vpnToggle.visible = true;
+
+        this._vpnToggle = null;
         this._vpnToggleSignalIds = [];
+        this._vpnToggleHiddenByNetBird = false;
+    }
+
+    _setCheckedFromStatus(checked) {
+        this._settingCheckedFromStatus = true;
+        if (this.checked !== checked)
+            this.checked = checked;
+        this._settingCheckedFromStatus = false;
+
+        this._indicator.visible = checked;
+    }
+
+    _syncFromStatus(status) {
+        this._lastConnectedStatus = status.connected;
+        this._setCheckedFromStatus(status.connected);
+        this._syncVpnQuickSetting();
+
+        if (status.profileName)
+            this._setSelectedProfileName(status.profileName);
+
+        if (this._hasError)
+            return;
+
+        if (status.status.toLowerCase() === 'connecting') {
+            this.subtitle = 'Connecting...';
+            return;
+        }
+
+        this.subtitle = this._selectedProfileName;
+    }
+
+    _setSelectedProfileName(profileName) {
+        this._selectedProfileName = profileName;
+        this._selectProfileName(profileName);
+    }
+
+    _selectProfileName(profileName) {
+        let selectedItem = null;
+        for (const item of this._profileItems) {
+            if (item._profileName === profileName) {
+                selectedItem = item;
+                break;
+            }
+        }
+
+        this._selectProfileItem(selectedItem);
+    }
+
+    _syncVpnQuickSetting() {
+        this._watchVpnQuickSetting();
+
+        if (!this._vpnToggle)
+            return;
+
+        const shouldHideVpnToggle =
+            this._lastConnectedStatus && this._vpnToggleLooksLikeNetBird(this._vpnToggle);
+
+        if (shouldHideVpnToggle) {
+            this._vpnToggleHiddenByNetBird = true;
+            if (this._vpnToggle.visible)
+                this._vpnToggle.visible = false;
+        } else if (this._vpnToggleHiddenByNetBird) {
+            this._vpnToggleHiddenByNetBird = false;
+            this._vpnToggle.visible = true;
+        }
     }
 
     _vpnToggleLooksLikeNetBird(vpnToggle) {
@@ -476,88 +401,37 @@ class NetBirdToggle extends QuickMenuToggle {
             typeof label === 'string' && NETBIRD_VPN_TOGGLE_NAMES.test(label));
     }
 
-    _installNetworkActivationFailureFilter(networkIndicator) {
-        if (this._networkIndicator === networkIndicator)
+    _setErrorState() {
+        this._hasError = true;
+        this.subtitle = 'ERROR';
+    }
+
+    _clearErrorState() {
+        if (!this._hasError)
             return;
 
-        this._restoreNetworkActivationFailureFilter();
+        this._hasError = false;
+        this.subtitle = this._selectedProfileName;
+    }
 
-        if (!networkIndicator?._onActivationFailed)
+    _notifyCliError(context, error) {
+        const message = formatErrorMessage(error);
+        console.warn(`${context}: ${message}`);
+
+        const nowUs = GLib.get_monotonic_time();
+        if (nowUs - this._lastErrorNotificationUs < NETBIRD_ERROR_NOTIFY_THROTTLE_US)
             return;
 
-        this._networkIndicator = networkIndicator;
-        this._originalNetworkActivationFailed = networkIndicator._onActivationFailed;
-        networkIndicator._onActivationFailed = (...args) => {
-            if (this._shouldSuppressNetworkActivationFailed())
-                return;
-
-            return this._originalNetworkActivationFailed.apply(networkIndicator, args);
-        };
+        this._lastErrorNotificationUs = nowUs;
+        Main.notify('NetBird', `${context}: ${message}`);
     }
 
-    _suppressNetworkActivationFailed() {
-        this._suppressNetworkActivationFailedUntil =
-            GLib.get_monotonic_time() + NETBIRD_DISCONNECT_FAILURE_SUPPRESS_MS * 1000;
-    }
-
-    _shouldSuppressNetworkActivationFailed() {
-        return GLib.get_monotonic_time() <= this._suppressNetworkActivationFailedUntil;
-    }
-
-    _restoreNetworkActivationFailureFilter() {
-        if (this._networkIndicator && this._originalNetworkActivationFailed)
-            this._networkIndicator._onActivationFailed = this._originalNetworkActivationFailed;
-
-        this._networkIndicator = null;
-        this._originalNetworkActivationFailed = null;
-        this._suppressNetworkActivationFailedUntil = 0;
-    }
-
-    _syncVpnStatusIcon(netBirdActive) {
-        const vpnIndicator = Main.panel.statusArea.quickSettings?._network?._vpnIndicator;
-
-        if (this._vpnIndicator && this._vpnIndicator !== vpnIndicator)
-            this._restoreVpnStatusIcon();
-
-        this._vpnIndicator = vpnIndicator ?? null;
-
-        if (netBirdActive && this._vpnIndicator) {
-            this._vpnIndicatorPatched = true;
-            this._vpnIndicator.gicon = this._gicon;
-            this._vpnIndicator.visible = true;
-            this._indicator.visible = false;
-        } else {
-            this._restoreVpnStatusIcon();
-            this._indicator.visible = this.checked;
-        }
-    }
-
-    _restoreVpnStatusIcon() {
-        if (this._vpnIndicatorPatched && this._vpnIndicator) {
-            this._vpnIndicator.gicon = null;
-            if (this._vpnToggle)
-                this._vpnIndicator.icon_name = this._vpnToggle.icon_name;
-        }
-
-        this._vpnIndicatorPatched = false;
-        this._vpnIndicator = null;
-    }
-
-    _restoreVpnQuickSetting() {
-        if (this._vpnToggle) {
-            this._disconnectVpnQuickSettingSignals();
-            if (this._vpnToggleHiddenByNetBird)
-                this._vpnToggle.visible = true;
-
-            this._restoreVpnStatusIcon();
-            this._vpnToggleHiddenByNetBird = false;
-            this._vpnToggle = null;
-        }
-        this._indicator.visible = false;
+    _notifyBrowserLogin() {
+        Main.notify('NetBird', 'Launching browser for NetBird sign in');
     }
 
     _addAdvancedSettingsItem() {
-        const item = new PopupMenu.PopupMenuItem(_('Advanced Settings'));
+        const item = new PopupMenu.PopupMenuItem('Advanced Settings');
         item.connect('activate', () => {
             // Placeholder until the extension grows a real preferences panel.
             this.menu.close();
@@ -567,17 +441,14 @@ class NetBirdToggle extends QuickMenuToggle {
 
     destroy() {
         this._destroyed = true;
-        this._profileListCancellable.cancel();
-        this._statusCancellable.cancel();
+        this._cancellable.cancel();
 
-        if (this._statusPollId)
-            GLib.source_remove(this._statusPollId);
+        this._unwatchVpnQuickSetting();
 
-        if (this._profileReloadRetryId)
-            GLib.source_remove(this._profileReloadRetryId);
-
-        this._restoreVpnQuickSetting();
-        this._restoreNetworkActivationFailureFilter();
+        if (this._quickSettingsMenuSignalId) {
+            this._quickSettingsMenu.disconnect(this._quickSettingsMenuSignalId);
+            this._quickSettingsMenuSignalId = 0;
+        }
 
         super.destroy();
     }
@@ -590,7 +461,6 @@ class NetBirdIndicator extends SystemIndicator {
 
         this._indicator = this._addIndicator();
         this._indicator.gicon = gicon;
-
         this._indicator.visible = false;
 
         const toggle = new NetBirdToggle(gicon, this._indicator);

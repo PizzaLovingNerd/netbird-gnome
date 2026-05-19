@@ -3,10 +3,9 @@
   "configurations": [
     {
       "name": "Open nested GNOME",
-      "type": "node",
-      "request": "launch",
-      "runtimeExecutable": "true",
-      "preLaunchTask": "Open nested GNOME"
+      "type": "node-terminal",
+      "command": "dbus-run-session -- gnome-shell --nested --wayland",
+      "request": "launch"
     }
   ]
 }
