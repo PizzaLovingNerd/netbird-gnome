@@ -59,6 +59,14 @@ function formatErrorMessage(error) {
         : firstUsefulLine;
 }
 
+function isCancellation(error, cancellable) {
+    if (cancellable?.is_cancelled())
+        return true;
+
+    return error instanceof GLib.Error &&
+        error.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED);
+}
+
 
 const NetBirdToggle = GObject.registerClass(
 class NetBirdToggle extends QuickMenuToggle {
@@ -70,6 +78,7 @@ class NetBirdToggle extends QuickMenuToggle {
             toggleMode: false,
         });
 
+        this._gicon = gicon;
         this._indicator = indicator;
         this._profileItems = [];
         this._selectedProfileName = '';
@@ -79,6 +88,10 @@ class NetBirdToggle extends QuickMenuToggle {
         this._loadingProfiles = false;
         this._settingCheckedFromStatus = false;
         this._toggleCommandInProgress = false;
+        this._toggleOperation = null;
+        this._toggleCommandCancellable = null;
+        this._toggleCancelRequested = false;
+        this._connectingFromStatus = false;
         this._statusRefreshInProgress = false;
         this._lastConnectedStatus = false;
         this._quickSettingsMenu = Main.panel.statusArea.quickSettings.menu;
@@ -86,7 +99,15 @@ class NetBirdToggle extends QuickMenuToggle {
         this._vpnToggle = null;
         this._vpnToggleSignalIds = [];
         this._vpnToggleHiddenByNetBird = false;
+        this._vpnIndicator = null;
+        this._vpnIndicatorOriginalGicon = null;
+        this._vpnIndicatorOriginalIconName = null;
+        this._vpnIndicatorPatched = false;
         this._lastErrorNotificationUs = 0;
+        this._activationFailedFilterInstalled = false;
+        this._networkIndicator = null;
+        this._originalOnActivationFailed = null;
+        this._vpnActivationFailedEmitted = false;
 
         this.menu.setHeader(gicon, 'NetBird');
 
@@ -100,6 +121,7 @@ class NetBirdToggle extends QuickMenuToggle {
             'open-state-changed',
             (_menu, isOpen) => this._onQuickSettingsOpenStateChanged(isOpen));
         this._watchVpnQuickSetting();
+        this._installNetworkActivationFailedFilter();
 
         this._loadProfiles();
 
@@ -223,36 +245,124 @@ class NetBirdToggle extends QuickMenuToggle {
     }
 
     async _onToggleClicked() {
-        if (this._toggleCommandInProgress)
+        if (this._toggleCommandInProgress) {
+            await this._cancelToggleOperation();
             return;
+        }
+
+        if (this._connectingFromStatus) {
+            await this._cancelConnect();
+            return;
+        }
 
         const requestedChecked = !this.checked;
-        this.subtitle = requestedChecked ? 'Connecting...' : 'Disconnecting...';
+        await this._runToggleOperation(requestedChecked ? 'connect' : 'disconnect');
+    }
+
+    _beginToggleCommand(operation) {
+        this._toggleCommandCancellable?.cancel();
+        this._toggleCommandCancellable = new Gio.Cancellable();
+        this._toggleCancelRequested = false;
+        this._toggleOperation = operation;
         this._toggleCommandInProgress = true;
+    }
+
+    _endToggleCommand() {
+        this._toggleOperation = null;
+        this._toggleCommandCancellable = null;
+        this._toggleCancelRequested = false;
+        this._toggleCommandInProgress = false;
+    }
+
+    async _runToggleOperation(operation) {
+        this._beginToggleCommand(operation);
+        this.subtitle = operation === 'connect' ? 'Connecting...' : 'Disconnecting...';
 
         try {
-            if (requestedChecked) {
+            if (operation === 'connect') {
                 await netbird_up({
-                    cancellable: this._cancellable,
+                    cancellable: this._toggleCommandCancellable,
                     onLoginUrlOpen: () => this._notifyBrowserLogin(),
                     profileName: this._selectedProfileName,
                     timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
                 });
             } else {
                 await netbird_down({
-                    cancellable: this._cancellable,
+                    cancellable: this._toggleCommandCancellable,
                     timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
                 });
             }
 
-            this._clearErrorState();
+            if (!this._toggleCancelRequested)
+                this._clearErrorState();
         } catch (error) {
+            if (this._toggleCancelRequested ||
+                isCancellation(error, this._toggleCommandCancellable))
+                return;
+
             if (!this._cancellable.is_cancelled()) {
                 this._setErrorState();
                 this._notifyCliError('Failed to change NetBird status', error);
             }
         } finally {
-            this._toggleCommandInProgress = false;
+            if (!this._toggleCancelRequested) {
+                this._endToggleCommand();
+                this._refreshStatus();
+            }
+        }
+    }
+
+    async _cancelToggleOperation() {
+        if (!this._toggleCommandInProgress || this._toggleCancelRequested)
+            return;
+
+        this._toggleCancelRequested = true;
+        const operation = this._toggleOperation;
+        const commandCancellable = this._toggleCommandCancellable;
+        commandCancellable?.cancel();
+        this.subtitle = 'Cancelling...';
+
+        try {
+            if (operation === 'connect') {
+                await netbird_down({
+                    cancellable: this._cancellable,
+                    timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
+                });
+            }
+            this._clearErrorState();
+        } catch (error) {
+            if (!this._cancellable.is_cancelled() && !isCancellation(error, commandCancellable))
+                this._notifyCliError('Failed to cancel NetBird connection', error);
+        } finally {
+            this._endToggleCommand();
+            this._setCheckedFromStatus(false);
+            this._refreshStatus();
+        }
+    }
+
+    async _cancelConnect() {
+        if (this._toggleCommandInProgress) {
+            await this._cancelToggleOperation();
+            return;
+        }
+
+        this._beginToggleCommand('disconnect');
+        this.subtitle = 'Cancelling...';
+
+        try {
+            await netbird_down({
+                cancellable: this._cancellable,
+                timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
+            });
+            this._clearErrorState();
+        } catch (error) {
+            if (!this._cancellable.is_cancelled()) {
+                this._setErrorState();
+                this._notifyCliError('Failed to cancel NetBird connection', error);
+            }
+        } finally {
+            this._endToggleCommand();
+            this._setCheckedFromStatus(false);
             this._refreshStatus();
         }
     }
@@ -288,6 +398,7 @@ class NetBirdToggle extends QuickMenuToggle {
             return;
 
         this._watchVpnQuickSetting();
+        this._installNetworkActivationFailedFilter();
         this._refreshStatus();
     }
 
@@ -307,6 +418,9 @@ class NetBirdToggle extends QuickMenuToggle {
             vpnToggle.connect('notify::visible', () => this._syncVpnQuickSetting()),
             vpnToggle.connect('notify::subtitle', () => this._syncVpnQuickSetting()),
             vpnToggle.connect('notify::icon-name', () => this._syncVpnQuickSetting()),
+            vpnToggle.connect('activation-failed', () => {
+                this._vpnActivationFailedEmitted = true;
+            }),
         ];
     }
 
@@ -318,6 +432,7 @@ class NetBirdToggle extends QuickMenuToggle {
         if (this._vpnToggleHiddenByNetBird)
             this._vpnToggle.visible = true;
 
+        this._restoreVpnStatusIcon();
         this._vpnToggle = null;
         this._vpnToggleSignalIds = [];
         this._vpnToggleHiddenByNetBird = false;
@@ -329,7 +444,7 @@ class NetBirdToggle extends QuickMenuToggle {
             this.checked = checked;
         this._settingCheckedFromStatus = false;
 
-        this._indicator.visible = checked;
+        this._indicator.visible = false;
     }
 
     _syncFromStatus(status) {
@@ -344,10 +459,12 @@ class NetBirdToggle extends QuickMenuToggle {
             return;
 
         if (status.status.toLowerCase() === 'connecting') {
+            this._connectingFromStatus = true;
             this.subtitle = 'Connecting...';
             return;
         }
 
+        this._connectingFromStatus = false;
         this.subtitle = this._selectedProfileName;
     }
 
@@ -371,11 +488,15 @@ class NetBirdToggle extends QuickMenuToggle {
     _syncVpnQuickSetting() {
         this._watchVpnQuickSetting();
 
-        if (!this._vpnToggle)
+        if (!this._vpnToggle) {
+            this._restoreVpnStatusIcon();
+            this._indicator.visible = this._lastConnectedStatus;
             return;
+        }
 
         const shouldHideVpnToggle =
             this._lastConnectedStatus && this._vpnToggleLooksLikeNetBird(this._vpnToggle);
+        this._syncVpnStatusIcon(shouldHideVpnToggle);
 
         if (shouldHideVpnToggle) {
             this._vpnToggleHiddenByNetBird = true;
@@ -385,6 +506,50 @@ class NetBirdToggle extends QuickMenuToggle {
             this._vpnToggleHiddenByNetBird = false;
             this._vpnToggle.visible = true;
         }
+    }
+
+    _syncVpnStatusIcon(useNetBirdIcon) {
+        const vpnIndicator = Main.panel.statusArea.quickSettings?._network?._vpnIndicator ?? null;
+
+        if (this._vpnIndicator && this._vpnIndicator !== vpnIndicator)
+            this._restoreVpnStatusIcon();
+
+        this._vpnIndicator = vpnIndicator;
+
+        if (useNetBirdIcon && this._vpnIndicator) {
+            if (!this._vpnIndicatorPatched) {
+                this._vpnIndicatorOriginalGicon = this._vpnIndicator.gicon ?? null;
+                this._vpnIndicatorOriginalIconName = this._vpnIndicator.icon_name ?? null;
+            }
+
+            this._vpnIndicatorPatched = true;
+            this._vpnIndicator.gicon = this._gicon;
+            this._vpnIndicator.visible = true;
+            this._indicator.visible = false;
+            return;
+        }
+
+        this._restoreVpnStatusIcon();
+        if (!this._lastConnectedStatus && this._vpnToggleLooksLikeNetBird(this._vpnToggle) &&
+            vpnIndicator) {
+            vpnIndicator.visible = false;
+        }
+
+        this._indicator.visible = this._lastConnectedStatus;
+    }
+
+    _restoreVpnStatusIcon() {
+        if (!this._vpnIndicatorPatched || !this._vpnIndicator)
+            return;
+
+        this._vpnIndicator.gicon = this._vpnIndicatorOriginalGicon;
+        if (this._vpnIndicatorOriginalIconName)
+            this._vpnIndicator.icon_name = this._vpnIndicatorOriginalIconName;
+
+        this._vpnIndicatorPatched = false;
+        this._vpnIndicatorOriginalGicon = null;
+        this._vpnIndicatorOriginalIconName = null;
+        this._vpnIndicator = null;
     }
 
     _vpnToggleLooksLikeNetBird(vpnToggle) {
@@ -399,6 +564,47 @@ class NetBirdToggle extends QuickMenuToggle {
 
         return labels.some(label =>
             typeof label === 'string' && NETBIRD_VPN_TOGGLE_NAMES.test(label));
+    }
+
+    _installNetworkActivationFailedFilter() {
+        const network = Main.panel.statusArea.quickSettings?._network ?? null;
+        if (!network || this._activationFailedFilterInstalled)
+            return;
+
+        this._networkIndicator = network;
+        this._originalOnActivationFailed = network._onActivationFailed.bind(network);
+        network._onActivationFailed = () => {
+            const fromVpn = this._vpnActivationFailedEmitted;
+            this._vpnActivationFailedEmitted = false;
+
+            if (fromVpn && this._shouldSuppressNetworkActivationFailed()) {
+                network._notification?.destroy();
+                network._notification = null;
+                return;
+            }
+
+            this._originalOnActivationFailed();
+        };
+        this._activationFailedFilterInstalled = true;
+    }
+
+    _uninstallNetworkActivationFailedFilter() {
+        if (!this._activationFailedFilterInstalled || !this._networkIndicator)
+            return;
+
+        this._networkIndicator._onActivationFailed = this._originalOnActivationFailed;
+        this._networkIndicator = null;
+        this._originalOnActivationFailed = null;
+        this._activationFailedFilterInstalled = false;
+        this._vpnActivationFailedEmitted = false;
+    }
+
+    _shouldSuppressNetworkActivationFailed() {
+        if (this._toggleCommandInProgress)
+            return true;
+
+        this._watchVpnQuickSetting();
+        return this._vpnToggle && this._vpnToggleLooksLikeNetBird(this._vpnToggle);
     }
 
     _setErrorState() {
@@ -441,9 +647,11 @@ class NetBirdToggle extends QuickMenuToggle {
 
     destroy() {
         this._destroyed = true;
+        this._toggleCommandCancellable?.cancel();
         this._cancellable.cancel();
 
         this._unwatchVpnQuickSetting();
+        this._uninstallNetworkActivationFailedFilter();
 
         if (this._quickSettingsMenuSignalId) {
             this._quickSettingsMenu.disconnect(this._quickSettingsMenuSignalId);
