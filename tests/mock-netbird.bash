@@ -8,6 +8,9 @@ case "${1:-}" in
   down)
     echo "Disconnected"
     ;;
+  deregister|logout)
+    echo "Deregistered successfully"
+    ;;
   status)
     echo '{"daemonStatus":"Connected"}'
     ;;

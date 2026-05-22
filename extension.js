@@ -28,47 +28,27 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 import {
     netbird_down,
+    netbird_profile_add,
     netbird_profile_list,
     netbird_profile_select,
     netbird_status,
     netbird_up,
 } from './api/index.js';
+import {formatErrorMessage, isCancellation} from './extensionErrors.js';
+import {promptProfileName} from './profile-add-dialog.js';
+import {readProfileEmail} from './profileState.js';
 
 const NETBIRD_COMMAND_TIMEOUT_MS = 30000;
 const NETBIRD_QUERY_TIMEOUT_MS = 5000;
 const NETBIRD_ERROR_NOTIFY_THROTTLE_US = 30000000;
 const NETBIRD_VPN_TOGGLE_NAMES = /\b(netbird|wiretrustee|wt0)\b/i;
-const NETBIRD_PROFILE_STATE_DIR = 'netbird';
 
 
-function formatErrorMessage(error) {
-    const output = [
-        error?.message,
-        error?.stdout,
-        error?.stderr,
-    ].filter(Boolean).join('\n').trim();
-
-    if (!output)
-        return String(error);
-
-    const firstUsefulLine = output
-        .split('\n')
-        .map(line => line.trim())
-        .find(line => line && !line.includes('caller_not_available')) ?? output;
-
-    return firstUsefulLine.length > 240
-        ? `${firstUsefulLine.slice(0, 237)}...`
-        : firstUsefulLine;
+function addMenuActionItem(menu, label, iconName, onActivate) {
+    const item = new PopupMenu.PopupImageMenuItem(label, iconName);
+    item.connect('activate', onActivate);
+    menu.addMenuItem(item);
 }
-
-function isCancellation(error, cancellable) {
-    if (cancellable?.is_cancelled())
-        return true;
-
-    return error instanceof GLib.Error &&
-        error.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED);
-}
-
 
 const NetBirdToggle = GObject.registerClass(
 class NetBirdToggle extends QuickMenuToggle {
@@ -84,11 +64,15 @@ class NetBirdToggle extends QuickMenuToggle {
         this._gicon = gicon;
         this._indicator = indicator;
         this._profileItems = [];
+        this._profileStatusItem = null;
+        this._addProfileMenuItem = null;
+        this._profileSectionIndex = 1;
         this._selectedProfileName = '';
         this._cancellable = new Gio.Cancellable();
         this._destroyed = false;
         this._hasError = false;
         this._loadingProfiles = false;
+        this._pendingProfileLoad = null;
         this._settingCheckedFromStatus = false;
         this._toggleCommandInProgress = false;
         this._toggleOperation = null;
@@ -115,11 +99,17 @@ class NetBirdToggle extends QuickMenuToggle {
         this._setHeader(null);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this._addProfileStatusItem('Loading profiles...');
+        this._createAddProfileMenuItem();
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this._addNetworksItem();
-        this._addProfileSettingsItem();
+        addMenuActionItem(this.menu, 'Networks', 'network-workgroup-symbolic', () => {
+            // Placeholder until Networks gets its dedicated NetBird settings view.
+            this.menu.close();
+        });
+        addMenuActionItem(this.menu, 'NetBird Settings', 'preferences-system-symbolic', () => {
+            this.menu.close();
+            this._extension.openProfileSettingsWindow();
+        });
 
         this.connect('clicked', () => this._onToggleClicked());
         this._quickSettingsMenuSignalId = this._quickSettingsMenu.connect(
@@ -132,6 +122,54 @@ class NetBirdToggle extends QuickMenuToggle {
 
         if (this._quickSettingsMenu.isOpen)
             this._refreshStatus();
+    }
+
+    _createAddProfileMenuItem() {
+        this._addProfileMenuItem = new PopupMenu.PopupImageMenuItem(
+            'Add Profile',
+            'list-add-symbolic');
+        this._addProfileMenuItem.connect('activate', () => {
+            this.menu.close();
+            this._openAddProfileDialog();
+        });
+        this.menu.addMenuItem(this._addProfileMenuItem, this._profileSectionIndex);
+    }
+
+    _repositionAddProfileMenuItem() {
+        if (!this._addProfileMenuItem)
+            return;
+
+        const profileBlockLength = this._profileItems.length +
+            (this._profileStatusItem ? 1 : 0);
+        this.menu.moveMenuItem(
+            this._addProfileMenuItem,
+            this._profileSectionIndex + profileBlockLength);
+    }
+
+    _clearProfileStatusItem() {
+        if (!this._profileStatusItem)
+            return;
+
+        this._profileStatusItem.destroy();
+        this._profileStatusItem = null;
+        this._repositionAddProfileMenuItem();
+    }
+
+    _showProfileStatus(label) {
+        this._clearProfileStatusItem();
+
+        const item = new PopupMenu.PopupMenuItem(label, {
+            reactive: false,
+            can_focus: false,
+        });
+
+        this._profileStatusItem = item;
+        this.menu.addMenuItem(item, this._profileSectionIndex);
+        this._repositionAddProfileMenuItem();
+    }
+
+    _findProfileItem(profileName) {
+        return this._profileItems.find(item => item._profileName === profileName) ?? null;
     }
 
     _addProfileItem(profileName) {
@@ -150,40 +188,95 @@ class NetBirdToggle extends QuickMenuToggle {
             this._selectProfile(profileName, item);
         });
 
+        const index = this._profileSectionIndex + this._profileItems.length;
+        this.menu.addMenuItem(item, index);
         this._profileItems.push(item);
-        this.menu.addMenuItem(item, this._profileItems.length);
-
+        this._repositionAddProfileMenuItem();
     }
 
-    _addProfileStatusItem(label) {
-        this._clearProfileItems();
+    _removeProfileItem(profileName) {
+        const item = this._findProfileItem(profileName);
+        if (!item)
+            return;
 
-        const item = new PopupMenu.PopupMenuItem(label, {
-            reactive: false,
-            can_focus: false,
-        });
-
-        this._profileItems.push(item);
-        this.menu.addMenuItem(item, 1);
+        item.destroy();
+        this._profileItems = this._profileItems.filter(
+            profileItem => profileItem !== item);
+        this._repositionAddProfileMenuItem();
     }
 
     _selectProfileItem(selectedItem) {
         this._profileItems.forEach(item => {
-            if (!item._checkIcon)
-                return;
-
             item._checkIcon.visible = item === selectedItem;
         });
     }
 
-    _clearProfileItems() {
-        this._profileItems.forEach(item => item.destroy());
-        this._profileItems = [];
+    _syncProfileList(profiles, activeProfile) {
+        this._clearProfileStatusItem();
+
+        const namesFromServer = new Set(profiles.map(profile => profile.name));
+
+        for (const item of [...this._profileItems]) {
+            if (!namesFromServer.has(item._profileName))
+                this._removeProfileItem(item._profileName);
+        }
+
+        for (const profile of profiles) {
+            if (!this._findProfileItem(profile.name))
+                this._addProfileItem(profile.name);
+        }
+
+        if (this._profileItems.length === 0)
+            this._showProfileStatus('No profiles found');
+
+        if (activeProfile)
+            this._setSelectedProfileName(activeProfile);
+        else
+            this._selectProfileName(this._selectedProfileName);
     }
 
-    async _loadProfiles() {
-        if (this._destroyed || this._loadingProfiles)
+    _openAddProfileDialog() {
+        promptProfileName({
+            onAccept: profileName => this._addProfile(profileName),
+        });
+    }
+
+    async _addProfile(profileName) {
+        if (this._destroyed || this._toggleCommandInProgress)
             return;
+
+        try {
+            await netbird_profile_add(profileName, {
+                cancellable: this._cancellable,
+                timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
+            });
+
+            if (this._destroyed)
+                return;
+
+            this._clearErrorState();
+            await this._loadProfiles({preserveExisting: true});
+            this._refreshStatus();
+        } catch (error) {
+            if (!this._cancellable.is_cancelled()) {
+                this._setErrorState();
+                this._notifyCliError('Failed to add NetBird profile', error);
+            }
+        }
+    }
+
+    async _loadProfiles({preserveExisting = false} = {}) {
+        if (this._destroyed)
+            return;
+
+        if (this._loadingProfiles) {
+            this._pendingProfileLoad = {preserveExisting};
+            return;
+        }
+
+        const showLoadingStatus = !preserveExisting && this._profileItems.length === 0;
+        if (showLoadingStatus)
+            this._showProfileStatus('Loading profiles...');
 
         this._loadingProfiles = true;
 
@@ -197,29 +290,22 @@ class NetBirdToggle extends QuickMenuToggle {
                 return;
 
             this._clearErrorState();
-            this._clearProfileItems();
-
-            if (profiles.length === 0) {
-                this._addProfileStatusItem('No profiles found');
-                return;
-            }
-
-            profiles.forEach(profile => {
-                this._addProfileItem(profile.name);
-            });
-
-            if (activeProfile && !this._selectedProfileName)
-                this._setSelectedProfileName(activeProfile);
-            else
-                this._selectProfileName(this._selectedProfileName);
+            this._syncProfileList(profiles, activeProfile);
         } catch (error) {
             if (!this._cancellable.is_cancelled()) {
                 this._setErrorState();
                 this._notifyCliError('Failed to load NetBird profiles', error);
-                this._addProfileStatusItem('Unable to load profiles');
+
+                if (!preserveExisting && this._profileItems.length === 0)
+                    this._showProfileStatus('Unable to load profiles');
             }
         } finally {
             this._loadingProfiles = false;
+
+            const pending = this._pendingProfileLoad;
+            this._pendingProfileLoad = null;
+            if (pending && !this._destroyed)
+                this._loadProfiles(pending);
         }
     }
 
@@ -244,7 +330,7 @@ class NetBirdToggle extends QuickMenuToggle {
             if (!this._cancellable.is_cancelled()) {
                 this._setErrorState();
                 this._notifyCliError('Failed to select NetBird profile', error);
-                this._loadProfiles();
+                this._loadProfiles({preserveExisting: true});
             }
         } finally {
             this._toggleCommandInProgress = false;
@@ -407,6 +493,7 @@ class NetBirdToggle extends QuickMenuToggle {
 
         this._watchVpnQuickSetting();
         this._installNetworkActivationFailedFilter();
+        this._loadProfiles({preserveExisting: true});
         this._refreshStatus();
     }
 
@@ -478,12 +565,8 @@ class NetBirdToggle extends QuickMenuToggle {
 
     _setSelectedProfileName(profileName) {
         this._selectedProfileName = profileName;
-        this._syncHeaderEmail();
+        this._setHeader(readProfileEmail(this._selectedProfileName) || null);
         this._selectProfileName(profileName);
-    }
-
-    _syncHeaderEmail() {
-        this._setHeader(this._readProfileEmail(this._selectedProfileName) || null);
     }
 
     _setHeader(subtitle) {
@@ -494,6 +577,8 @@ class NetBirdToggle extends QuickMenuToggle {
         if (!header)
             return;
 
+        // GNOME Shell does not expose enough public API to align this custom
+        // quick settings header, so the private header actors are adjusted here.
         header.style = hasSubtitle
             ? 'padding-top: 8px; padding-bottom: 8px;'
             : 'padding-top: 8px; padding-bottom: 8px; min-height: 48px;';
@@ -515,28 +600,6 @@ class NetBirdToggle extends QuickMenuToggle {
         if (this.menu._headerSubtitle) {
             this.menu._headerSubtitle.visible = hasSubtitle;
             this.menu._headerSubtitle.height = hasSubtitle ? -1 : 0;
-        }
-    }
-
-    _readProfileEmail(profileName) {
-        if (!profileName)
-            return '';
-
-        const statePath = GLib.build_filenamev([
-            GLib.get_user_config_dir(),
-            NETBIRD_PROFILE_STATE_DIR,
-            `${profileName}.state.json`,
-        ]);
-
-        try {
-            const [ok, contents] = GLib.file_get_contents(statePath);
-            if (!ok)
-                return '';
-
-            const profileState = JSON.parse(new TextDecoder().decode(contents));
-            return typeof profileState.email === 'string' ? profileState.email.trim() : '';
-        } catch {
-            return '';
         }
     }
 
@@ -703,28 +766,6 @@ class NetBirdToggle extends QuickMenuToggle {
         Main.notify('NetBird', 'Launching browser for NetBird sign in');
     }
 
-    _addNetworksItem() {
-        const item = new PopupMenu.PopupImageMenuItem(
-            'Networks',
-            'network-workgroup-symbolic');
-        item.connect('activate', () => {
-            // Placeholder until Networks gets its dedicated NetBird settings view.
-            this.menu.close();
-        });
-        this.menu.addMenuItem(item);
-    }
-
-    _addProfileSettingsItem() {
-        const item = new PopupMenu.PopupImageMenuItem(
-            'NetBird Settings',
-            'preferences-system-symbolic');
-        item.connect('activate', () => {
-            this.menu.close();
-            this._extension.openProfileSettingsWindow();
-        });
-        this.menu.addMenuItem(item);
-    }
-
     destroy() {
         this._destroyed = true;
         this._toggleCommandCancellable?.cancel();
@@ -762,9 +803,9 @@ export default class NetBirdExtension extends Extension {
         const gjs = GLib.find_program_in_path('gjs') ?? 'gjs';
 
         try {
-            Gio.Subprocess.new(
-                [gjs, '-m', settingsWindow],
-                Gio.SubprocessFlags.NONE);
+            const launcher = new Gio.SubprocessLauncher({});
+            launcher.setenv('NETBIRD_GNOME_EXTENSION_DIR', this.dir.get_path(), true);
+            launcher.spawnv([gjs, '-m', settingsWindow]);
         } catch (error) {
             Main.notify('NetBird', `Failed to open settings: ${formatErrorMessage(error)}`);
         }

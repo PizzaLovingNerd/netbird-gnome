@@ -2,6 +2,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import {
+    netbird_deregister,
     netbird_down,
     netbird_profile_add,
     netbird_profile_list,
@@ -41,6 +42,9 @@ const tests = [
         if (!notifiedLoginUrl)
             throw new Error('expected login URL notification callback');
     }],
+    ['netbird_deregister', () => netbird_deregister('default', {timeoutMs: TEST_TIMEOUT_MS})],
+    ['netbird_deregister with cancellable', () =>
+        netbird_deregister('default', withCancellable())],
     ['netbird_down', () => netbird_down({timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_down with cancellable', () => netbird_down(withCancellable())],
     ['netbird_status', () => netbird_status({timeoutMs: TEST_TIMEOUT_MS})],

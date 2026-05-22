@@ -64,6 +64,12 @@ export const SETTINGS_PAGES = [
         ],
     },
     {
+        title: 'Profiles',
+        iconName: 'avatar-default-symbolic',
+        type: 'profiles',
+        groups: [],
+    },
+    {
         title: 'Connection',
         iconName: 'network-vpn-symbolic',
         groups: [
@@ -74,7 +80,7 @@ export const SETTINGS_PAGES = [
                         key: 'profile',
                         type: 'action',
                         title: 'Profile',
-                        subtitle: 'CameronKnauffHosted',
+                        subtitle: 'Open profile management',
                     },
                 ],
             },
@@ -85,7 +91,7 @@ export const SETTINGS_PAGES = [
                         key: 'managementUrl',
                         type: 'entry',
                         title: 'Management URL',
-                        defaultValue: 'https://netbird.cameronknauff.com:443',
+                        defaultValue: '',
                     },
                     {
                         key: 'preSharedKey',

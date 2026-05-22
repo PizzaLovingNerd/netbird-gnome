@@ -1,4 +1,5 @@
 import Gio from 'gi://Gio';
+import GioUnix from 'gi://GioUnix';
 import GLib from 'gi://GLib';
 
 
@@ -47,7 +48,9 @@ export async function runNetBird(args, {
         });
     }
 
-    try {
+    try {    
+        void (GioUnix.InputStream); // Fixes GJS warning to use platform-specific stream type.
+
         const [stdout, stderr] = await Promise.all([
             readStream(subprocess.get_stdout_pipe(), commandCancellable, chunk => {
                 logCliOutput('stdout', chunk);

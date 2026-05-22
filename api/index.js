@@ -1,4 +1,5 @@
 export {NetBirdCliError, runNetBird} from './command.js';
+export {netbird_deregister} from './deregister.js';
 export {netbird_down} from './down.js';
 export {
     netbird_profile_add,

@@ -1,0 +1,59 @@
+#!/bin/bash
+set -euo pipefail
+
+ACTION="${1:-}"
+TARGET="${2:-}"
+SOURCE="${3:-}"
+
+HELPER_NAME="netbird-gnome-config-write"
+ALLOWED_PREFIXES=("/var/lib/netbird" "/etc/netbird")
+
+usage() {
+    echo "Usage: ${HELPER_NAME} <read|write> <target-path> [source-path]" >&2
+    exit 1
+}
+
+is_allowed_path() {
+    local path="$1"
+    local realpath
+    realpath="$(readlink -f "${path}" 2>/dev/null || true)"
+    if [[ -z "${realpath}" ]]; then
+        realpath="${path}"
+    fi
+
+    for prefix in "${ALLOWED_PREFIXES[@]}"; do
+        case "${realpath}" in
+            "${prefix}"|"${prefix}"/*)
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+[[ -n "${ACTION}" && -n "${TARGET}" ]] || usage
+
+if ! is_allowed_path "${TARGET}"; then
+    echo "${HELPER_NAME}: refusing path outside NetBird config directories: ${TARGET}" >&2
+    exit 1
+fi
+
+case "${ACTION}" in
+    read)
+        if [[ ! -f "${TARGET}" ]]; then
+            echo "${HELPER_NAME}: file not found: ${TARGET}" >&2
+            exit 1
+        fi
+        cat "${TARGET}"
+        ;;
+    write)
+        [[ -n "${SOURCE}" && -f "${SOURCE}" ]] || usage
+        dest_dir="$(dirname "${TARGET}")"
+        mkdir -p "${dest_dir}"
+        install -m 600 -o root -g root "${SOURCE}" "${TARGET}"
+        ;;
+    *)
+        usage
+        ;;
+esac

@@ -18,6 +18,9 @@ case "${command}" in
     down)
         echo "Disconnected"
         ;;
+    deregister|logout)
+        echo "Deregistered successfully"
+        ;;
     status)
         if [[ -n "${NETBIRD_FAKE_STATUS_JSON:-}" ]]; then
             echo "${NETBIRD_FAKE_STATUS_JSON}"
