@@ -3,6 +3,7 @@ import GLib from 'gi://GLib';
 
 import {
     netbird_deregister,
+    netbird_debug_bundle,
     netbird_down,
     netbird_profile_add,
     netbird_profile_list,
@@ -10,16 +11,12 @@ import {
     netbird_profile_select,
     netbird_status,
     netbird_up,
-    runNetBird,
 } from '../api/index.js';
 
 
 const TEST_TIMEOUT_MS = 1000;
 
 const tests = [
-    ['runNetBird', () => runNetBird(['status', '--json'], {timeoutMs: TEST_TIMEOUT_MS})],
-    ['runNetBird with cancellable', () =>
-        runNetBird(['status', '--json'], withCancellable())],
     ['netbird_up', () => netbird_up({profileName: 'default', timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_up with cancellable', () =>
         netbird_up({...withCancellable(), profileName: 'default'})],
@@ -45,6 +42,9 @@ const tests = [
     ['netbird_deregister', () => netbird_deregister('default', {timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_deregister with cancellable', () =>
         netbird_deregister('default', withCancellable())],
+    ['netbird_debug_bundle', () => netbird_debug_bundle({timeoutMs: TEST_TIMEOUT_MS})],
+    ['netbird_debug_bundle with cancellable', () =>
+        netbird_debug_bundle(withCancellable())],
     ['netbird_down', () => netbird_down({timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_down with cancellable', () => netbird_down(withCancellable())],
     ['netbird_status', () => netbird_status({timeoutMs: TEST_TIMEOUT_MS})],
@@ -84,16 +84,17 @@ const tests = [
 
 
 async function main() {
-    const fakeCli = GLib.build_filenamev([
-        GLib.get_current_dir(),
-        'tests',
-        'fixtures',
-        'fake-netbird',
-    ]);
-    GLib.setenv('NETBIRD_CLI', fakeCli, true);
+    const server = new FakeNetBirdJsonServer();
+    server.start();
+    GLib.setenv('NETBIRD_JSON_SOCKET', `tcp://127.0.0.1:${server.port}`, true);
 
-    for (const [name, test] of tests)
-        await assertDoesNotThrow(name, test);
+    try {
+        for (const [name, test] of tests)
+            await assertDoesNotThrow(name, test);
+    } finally {
+        server.stop();
+        GLib.unsetenv('NETBIRD_JSON_SOCKET');
+    }
 }
 
 async function assertDoesNotThrow(name, callback) {
@@ -119,12 +120,14 @@ async function assertStatusConnected(statusJson, expected) {
 
 async function assertStatusProfileName(statusJson, expected) {
     GLib.setenv('NETBIRD_FAKE_STATUS_JSON', statusJson, true);
+    GLib.setenv('NETBIRD_FAKE_ACTIVE_PROFILE', expected, true);
     try {
         const status = await netbird_status({timeoutMs: TEST_TIMEOUT_MS});
         if (status.profileName !== expected)
             throw new Error(`expected profileName=${expected}, got ${status.profileName}`);
     } finally {
         GLib.unsetenv('NETBIRD_FAKE_STATUS_JSON');
+        GLib.unsetenv('NETBIRD_FAKE_ACTIVE_PROFILE');
     }
 }
 
@@ -133,6 +136,202 @@ function withCancellable() {
         cancellable: new Gio.Cancellable(),
         timeoutMs: TEST_TIMEOUT_MS,
     };
+}
+
+class FakeNetBirdJsonServer {
+    constructor() {
+        this._service = new Gio.SocketService();
+        this._service.connect('incoming', (_service, connection) => {
+            void this._handleConnection(connection);
+            return true;
+        });
+        this.port = 0;
+    }
+
+    start() {
+        this.port = this._service.add_any_inet_port(null);
+        this._service.start();
+    }
+
+    stop() {
+        this._service.stop();
+        this._service.close();
+    }
+
+    async _handleConnection(connection) {
+        try {
+            const request = await readHttpRequest(connection.get_input_stream());
+            const {statusCode, body} = this._dispatch(request);
+            await writeHttpResponse(connection.get_output_stream(), statusCode, body);
+        } finally {
+            connection.close(null);
+        }
+    }
+
+    _dispatch(request) {
+        const method = request.path.split('/').pop();
+
+        if (method === 'Up' && GLib.getenv('NETBIRD_FAKE_LOGIN') === '1') {
+            return {
+                statusCode: 500,
+                body: {
+                    message: 'Please log in at https://login.example.test/device?user_code=NETBIRD',
+                },
+            };
+        }
+
+        if (method === 'Status') {
+            const statusData = GLib.getenv('NETBIRD_FAKE_STATUS_JSON');
+            if (statusData)
+                return {statusCode: 200, body: JSON.parse(statusData)};
+
+            return {
+                statusCode: 200,
+                body: {
+                    status: 'Connected',
+                    fullStatus: {
+                        localPeerState: {
+                            IP: '100.64.0.1/32',
+                        },
+                    },
+                },
+            };
+        }
+
+        if (method === 'GetActiveProfile') {
+            return {
+                statusCode: 200,
+                body: {
+                    profileName: GLib.getenv('NETBIRD_FAKE_ACTIVE_PROFILE') || 'default',
+                    username: GLib.get_user_name(),
+                },
+            };
+        }
+
+        if (method === 'ListProfiles') {
+            return {
+                statusCode: 200,
+                body: {
+                    profiles: [
+                        {name: 'default', isActive: true},
+                        {name: 'Work Profile', isActive: false},
+                    ],
+                },
+            };
+        }
+
+        if ([
+            'AddProfile',
+            'DebugBundle',
+            'Down',
+            'Logout',
+            'RemoveProfile',
+            'SwitchProfile',
+            'Up',
+        ].includes(method)) {
+            return {statusCode: 200, body: {}};
+        }
+
+        return {
+            statusCode: 404,
+            body: {
+                message: `unknown method: ${method}`,
+            },
+        };
+    }
+}
+
+function readHttpRequest(stream) {
+    const decoder = new TextDecoder();
+    let text = '';
+    let headerEnd = -1;
+    let contentLength = null;
+
+    return new Promise((resolve, reject) => {
+        function readNext() {
+            stream.read_bytes_async(4096, GLib.PRIORITY_DEFAULT, null, (source, result) => {
+                try {
+                    const bytes = source.read_bytes_finish(result);
+                    if (bytes.get_size() === 0) {
+                        resolve(parseHttpRequest(text));
+                        return;
+                    }
+
+                    text += decoder.decode(bytes.toArray());
+                    if (headerEnd === -1) {
+                        headerEnd = text.indexOf('\r\n\r\n');
+                        if (headerEnd !== -1)
+                            contentLength = parseContentLength(text.slice(0, headerEnd));
+                    }
+
+                    if (headerEnd !== -1) {
+                        const body = text.slice(headerEnd + 4);
+                        if (contentLength === null || new TextEncoder().encode(body).length >= contentLength) {
+                            resolve(parseHttpRequest(text));
+                            return;
+                        }
+                    }
+
+                    readNext();
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        }
+
+        readNext();
+    });
+}
+
+function parseHttpRequest(text) {
+    const headerEnd = text.indexOf('\r\n\r\n');
+    const [requestLine] = text.slice(0, headerEnd).split('\r\n');
+    const [, path] = requestLine.split(' ');
+    const body = text.slice(headerEnd + 4).trim();
+
+    return {
+        body: body ? JSON.parse(body) : {},
+        path,
+    };
+}
+
+function parseContentLength(headerText) {
+    const line = headerText
+        .split('\r\n')
+        .find(value => value.toLowerCase().startsWith('content-length:'));
+    if (!line)
+        return null;
+
+    const value = Number(line.slice(line.indexOf(':') + 1).trim());
+    return Number.isFinite(value) ? value : null;
+}
+
+function writeHttpResponse(stream, statusCode, body) {
+    const responseBody = JSON.stringify(body);
+    const reason = statusCode === 200 ? 'OK' : 'Error';
+    const response = [
+        `HTTP/1.1 ${statusCode} ${reason}`,
+        'Content-Type: application/json',
+        `Content-Length: ${new TextEncoder().encode(responseBody).length}`,
+        'Connection: close',
+        '',
+        responseBody,
+    ].join('\r\n');
+
+    return new Promise((resolve, reject) => {
+        stream.write_all_async(
+            new TextEncoder().encode(response),
+            GLib.PRIORITY_DEFAULT,
+            null,
+            (source, result) => {
+                try {
+                    source.write_all_finish(result);
+                    resolve();
+                } catch (error) {
+                    reject(error);
+                }
+            });
+    });
 }
 
 await main();

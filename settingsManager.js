@@ -1,6 +1,11 @@
 import {SETTINGS_PAGES} from './settings.js';
-import {netbird_down, netbird_profile_select, netbird_status, netbird_up, runNetBird} from './api/index.js';
-import {buildUpArgsForChanges} from './api/settingsUpFlags.js';
+import {
+    netbird_debug_bundle,
+    netbird_down,
+    netbird_profile_select,
+    netbird_status,
+    netbird_up,
+} from './api/index.js';
 import {
     getActiveProfileName,
     MASKED_PRESHARED_KEY,
@@ -20,9 +25,7 @@ const NETBIRD_SETTINGS_TIMEOUT_MS = 30000;
 const NETBIRD_SETTINGS_QUERY_TIMEOUT_MS = 5000;
 
 const ACTION_HANDLERS = {
-    createDebugBundle: {
-        args: ['debug', 'bundle'],
-    },
+    createDebugBundle: netbird_debug_bundle,
 };
 
 const NETBIRD_SETTINGS = {
@@ -202,11 +205,9 @@ export class SettingsManager {
         if (!status.connected)
             return;
 
-        const upArgs = buildUpArgsForChanges(changes);
         await netbird_down({timeoutMs: NETBIRD_SETTINGS_TIMEOUT_MS});
         await netbird_up({
             profileName,
-            extraArgs: upArgs,
             openLoginUrl: false,
             timeoutMs: NETBIRD_SETTINGS_TIMEOUT_MS,
         });
@@ -231,7 +232,7 @@ export class SettingsManager {
         if (!handler)
             return;
 
-        await runNetBird(handler.args, {
+        await handler({
             timeoutMs: NETBIRD_SETTINGS_TIMEOUT_MS,
         });
     }

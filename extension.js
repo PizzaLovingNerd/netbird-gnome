@@ -50,6 +50,15 @@ function addMenuActionItem(menu, label, iconName, onActivate) {
     menu.addMenuItem(item);
 }
 
+function readStringProperty(object, propertyName) {
+    try {
+        const value = object?.[propertyName];
+        return typeof value === 'string' ? value : '';
+    } catch {
+        return '';
+    }
+}
+
 const NetBirdToggle = GObject.registerClass(
 class NetBirdToggle extends QuickMenuToggle {
     constructor(extension, gicon, indicator) {
@@ -85,11 +94,8 @@ class NetBirdToggle extends QuickMenuToggle {
         this._quickSettingsMenuSignalId = 0;
         this._vpnToggle = null;
         this._vpnToggleSignalIds = [];
-        this._vpnToggleHiddenByNetBird = false;
-        this._vpnIndicator = null;
-        this._vpnIndicatorOriginalGicon = null;
-        this._vpnIndicatorOriginalIconName = null;
-        this._vpnIndicatorPatched = false;
+        this._vpnToggleOriginalGetActiveItems = null;
+        this._vpnToggleOriginalGetPrimaryItem = null;
         this._lastErrorNotificationUs = 0;
         this._activationFailedFilterInstalled = false;
         this._networkIndicator = null;
@@ -508,9 +514,9 @@ class NetBirdToggle extends QuickMenuToggle {
             return;
 
         this._vpnToggle = vpnToggle;
+        this._patchVpnQuickSetting();
         this._vpnToggleSignalIds = [
             vpnToggle.connect('notify::checked', () => this._refreshStatus()),
-            vpnToggle.connect('notify::visible', () => this._syncVpnQuickSetting()),
             vpnToggle.connect('notify::subtitle', () => this._syncVpnQuickSetting()),
             vpnToggle.connect('notify::icon-name', () => this._syncVpnQuickSetting()),
             vpnToggle.connect('activation-failed', () => {
@@ -524,13 +530,9 @@ class NetBirdToggle extends QuickMenuToggle {
             return;
 
         this._vpnToggleSignalIds.forEach(id => this._vpnToggle.disconnect(id));
-        if (this._vpnToggleHiddenByNetBird)
-            this._vpnToggle.visible = true;
-
-        this._restoreVpnStatusIcon();
+        this._unpatchVpnQuickSetting();
         this._vpnToggle = null;
         this._vpnToggleSignalIds = [];
-        this._vpnToggleHiddenByNetBird = false;
     }
 
     _setCheckedFromStatus(checked) {
@@ -619,67 +621,76 @@ class NetBirdToggle extends QuickMenuToggle {
         this._watchVpnQuickSetting();
 
         if (!this._vpnToggle) {
-            this._restoreVpnStatusIcon();
             this._indicator.visible = this._lastConnectedStatus;
             return;
         }
 
-        const shouldHideVpnToggle =
-            this._lastConnectedStatus && this._vpnToggleLooksLikeNetBird(this._vpnToggle);
-        this._syncVpnStatusIcon(shouldHideVpnToggle);
-
-        if (shouldHideVpnToggle) {
-            this._vpnToggleHiddenByNetBird = true;
-            if (this._vpnToggle.visible)
-                this._vpnToggle.visible = false;
-        } else if (this._vpnToggleHiddenByNetBird) {
-            this._vpnToggleHiddenByNetBird = false;
-            this._vpnToggle.visible = true;
-        }
-    }
-
-    _syncVpnStatusIcon(useNetBirdIcon) {
-        const vpnIndicator = Main.panel.statusArea.quickSettings?._network?._vpnIndicator ?? null;
-
-        if (this._vpnIndicator && this._vpnIndicator !== vpnIndicator)
-            this._restoreVpnStatusIcon();
-
-        this._vpnIndicator = vpnIndicator;
-
-        if (useNetBirdIcon && this._vpnIndicator) {
-            if (!this._vpnIndicatorPatched) {
-                this._vpnIndicatorOriginalGicon = this._vpnIndicator.gicon ?? null;
-                this._vpnIndicatorOriginalIconName = this._vpnIndicator.icon_name ?? null;
-            }
-
-            this._vpnIndicatorPatched = true;
-            this._vpnIndicator.gicon = this._gicon;
-            this._vpnIndicator.visible = true;
-            this._indicator.visible = false;
-            return;
-        }
-
-        this._restoreVpnStatusIcon();
-        if (!this._lastConnectedStatus && this._vpnToggleLooksLikeNetBird(this._vpnToggle) &&
-            vpnIndicator) {
-            vpnIndicator.visible = false;
-        }
-
+        this._patchVpnQuickSetting();
+        this._vpnToggle._sync?.();
         this._indicator.visible = this._lastConnectedStatus;
     }
 
-    _restoreVpnStatusIcon() {
-        if (!this._vpnIndicatorPatched || !this._vpnIndicator)
+    _patchVpnQuickSetting() {
+        if (!this._vpnToggle ||
+            this._vpnToggleOriginalGetActiveItems ||
+            this._vpnToggleOriginalGetPrimaryItem)
             return;
 
-        this._vpnIndicator.gicon = this._vpnIndicatorOriginalGicon;
-        if (this._vpnIndicatorOriginalIconName)
-            this._vpnIndicator.icon_name = this._vpnIndicatorOriginalIconName;
+        const originalGetActiveItems = this._vpnToggle._getActiveItems;
+        const originalGetPrimaryItem = this._vpnToggle._getPrimaryItem;
+        if (typeof originalGetActiveItems !== 'function' ||
+            typeof originalGetPrimaryItem !== 'function')
+            return;
 
-        this._vpnIndicatorPatched = false;
-        this._vpnIndicatorOriginalGicon = null;
-        this._vpnIndicatorOriginalIconName = null;
-        this._vpnIndicator = null;
+        this._vpnToggleOriginalGetActiveItems = originalGetActiveItems;
+        this._vpnToggleOriginalGetPrimaryItem = originalGetPrimaryItem;
+
+        const netBirdToggle = this;
+        this._vpnToggle._getActiveItems = function* () {
+            for (const item of originalGetActiveItems.call(this)) {
+                if (!netBirdToggle._vpnItemLooksLikeNetBird(item))
+                    yield item;
+            }
+        };
+
+        this._vpnToggle._getPrimaryItem = function () {
+            const [activeItem] = this._getActiveItems();
+            if (activeItem)
+                return activeItem;
+
+            const itemSorter = this._itemSorter;
+            if (itemSorter?.itemsByMru) {
+                for (const item of itemSorter.itemsByMru()) {
+                    if (!netBirdToggle._vpnItemLooksLikeNetBird(item) &&
+                        item.timestamp > 0)
+                        return item;
+                }
+            }
+
+            if (itemSorter?.[Symbol.iterator]) {
+                for (const item of itemSorter) {
+                    if (!netBirdToggle._vpnItemLooksLikeNetBird(item) &&
+                        item.visible)
+                        return item;
+                }
+            }
+
+            return null;
+        };
+    }
+
+    _unpatchVpnQuickSetting() {
+        if (!this._vpnToggle)
+            return;
+
+        if (this._vpnToggleOriginalGetActiveItems)
+            this._vpnToggle._getActiveItems = this._vpnToggleOriginalGetActiveItems;
+        if (this._vpnToggleOriginalGetPrimaryItem)
+            this._vpnToggle._getPrimaryItem = this._vpnToggleOriginalGetPrimaryItem;
+
+        this._vpnToggleOriginalGetActiveItems = null;
+        this._vpnToggleOriginalGetPrimaryItem = null;
+        this._vpnToggle._sync?.();
     }
 
     _vpnToggleLooksLikeNetBird(vpnToggle) {
@@ -690,6 +701,20 @@ class NetBirdToggle extends QuickMenuToggle {
             vpnToggle._label?.text,
             vpnToggle._title?.text,
             vpnToggle._subtitle?.text,
+        ];
+
+        return labels.some(label =>
+            typeof label === 'string' && NETBIRD_VPN_TOGGLE_NAMES.test(label));
+    }
+
+    _vpnItemLooksLikeNetBird(item) {
+        const labels = [
+            readStringProperty(item, 'name'),
+            readStringProperty(item, 'title'),
+            item?.label?.text,
+            item?._label?.text,
+            item?._connection?.get_id?.(),
+            item?._activeConnection?.connection?.get_id?.(),
         ];
 
         return labels.some(label =>
