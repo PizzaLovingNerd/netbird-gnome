@@ -161,8 +161,8 @@ class FakeNetBirdJsonServer {
     async _handleConnection(connection) {
         try {
             const request = await readHttpRequest(connection.get_input_stream());
-            const {statusCode, body} = this._dispatch(request);
-            await writeHttpResponse(connection.get_output_stream(), statusCode, body);
+            const response = this._dispatch(request);
+            await writeHttpResponse(connection.get_output_stream(), response);
         } finally {
             connection.close(null);
         }
@@ -183,10 +183,13 @@ class FakeNetBirdJsonServer {
         if (method === 'Status') {
             const statusData = GLib.getenv('NETBIRD_FAKE_STATUS_JSON');
             if (statusData)
-                return {statusCode: 200, body: JSON.parse(statusData)};
+                return {
+                    body: JSON.parse(statusData),
+                    chunked: true,
+                    statusCode: 200,
+                };
 
             return {
-                statusCode: 200,
                 body: {
                     status: 'Connected',
                     fullStatus: {
@@ -195,6 +198,8 @@ class FakeNetBirdJsonServer {
                         },
                     },
                 },
+                chunked: true,
+                statusCode: 200,
             };
         }
 
@@ -306,17 +311,28 @@ function parseContentLength(headerText) {
     return Number.isFinite(value) ? value : null;
 }
 
-function writeHttpResponse(stream, statusCode, body) {
+function writeHttpResponse(stream, {
+    body,
+    chunked = false,
+    statusCode,
+}) {
     const responseBody = JSON.stringify(body);
     const reason = statusCode === 200 ? 'OK' : 'Error';
-    const response = [
+    const headers = [
         `HTTP/1.1 ${statusCode} ${reason}`,
         'Content-Type: application/json',
-        `Content-Length: ${new TextEncoder().encode(responseBody).length}`,
         'Connection: close',
-        '',
-        responseBody,
-    ].join('\r\n');
+    ];
+    let wireBody = responseBody;
+
+    if (chunked) {
+        headers.push('Transfer-Encoding: chunked');
+        wireBody = `${responseBody.length.toString(16)}\r\n${responseBody}\r\n0\r\n\r\n`;
+    } else {
+        headers.push(`Content-Length: ${new TextEncoder().encode(responseBody).length}`);
+    }
+
+    const response = `${headers.join('\r\n')}\r\n\r\n${wireBody}`;
 
     return new Promise((resolve, reject) => {
         stream.write_all_async(

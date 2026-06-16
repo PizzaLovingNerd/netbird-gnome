@@ -5,11 +5,22 @@ import GLib from 'gi://GLib';
 export const DEFAULT_TIMEOUT_MS = 15000;
 
 const DEFAULT_NETBIRD_JSON_SOCKET = 'unix:///var/run/netbird-http.sock';
-const DEBUG_API_OUTPUT = true;
+const DEBUG_API_OUTPUT = false;
+const MIN_UNIX_SOCKET_AGE_US = 2000000;
 const SERVICE_PARAMS_PATHS = [
     '/var/lib/netbird/service.json',
     '/etc/netbird/service.json',
 ];
+
+
+export function netbird_json_api_available() {
+    const endpoint = netbirdJsonSocket();
+
+    if (endpoint.startsWith('unix://'))
+        return unixSocketIsStable(endpoint.slice('unix://'.length));
+
+    return true;
+}
 
 
 export async function netbird_debug_bundle({
@@ -599,18 +610,37 @@ function parseResponse(text) {
         throw new Error('Invalid NetBird JSON API response');
 
     const headerText = text.slice(0, headerEnd);
-    const body = text.slice(headerEnd + 4);
+    let body = text.slice(headerEnd + 4);
+    const headers = parseHeaders(headerText);
     const [statusLine] = headerText.split('\r\n');
     const statusMatch = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})\s*(.*)$/);
 
     if (!statusMatch)
         throw new Error(`Invalid NetBird JSON API status line: ${statusLine}`);
 
+    if (headers.get('transfer-encoding')?.toLowerCase().includes('chunked'))
+        body = decodeChunkedBody(body);
+
     return {
         body,
         statusCode: Number(statusMatch[1]),
         statusText: statusMatch[2] || '',
     };
+}
+
+function parseHeaders(headerText) {
+    const headers = new Map();
+    for (const line of headerText.split('\r\n').slice(1)) {
+        const separator = line.indexOf(':');
+        if (separator === -1)
+            continue;
+
+        headers.set(
+            line.slice(0, separator).trim().toLowerCase(),
+            line.slice(separator + 1).trim());
+    }
+
+    return headers;
 }
 
 function parseContentLength(headerText) {
@@ -622,6 +652,31 @@ function parseContentLength(headerText) {
 
     const value = Number(line.slice(line.indexOf(':') + 1).trim());
     return Number.isFinite(value) ? value : null;
+}
+
+function decodeChunkedBody(body) {
+    let offset = 0;
+    const chunks = [];
+
+    while (offset < body.length) {
+        const lineEnd = body.indexOf('\r\n', offset);
+        if (lineEnd === -1)
+            break;
+
+        const sizeText = body.slice(offset, lineEnd).split(';')[0].trim();
+        const size = Number.parseInt(sizeText, 16);
+        if (!Number.isFinite(size))
+            break;
+
+        offset = lineEnd + 2;
+        if (size === 0)
+            break;
+
+        chunks.push(body.slice(offset, offset + size));
+        offset += size + 2;
+    }
+
+    return chunks.join('');
 }
 
 function parseJsonBody(body) {
@@ -665,6 +720,24 @@ function netbirdJsonSocket() {
     return GLib.getenv('NETBIRD_JSON_SOCKET') ||
         readConfiguredJsonSocket() ||
         DEFAULT_NETBIRD_JSON_SOCKET;
+}
+
+function unixSocketIsStable(path) {
+    if (!GLib.file_test(path, GLib.FileTest.EXISTS))
+        return false;
+
+    try {
+        const info = Gio.File.new_for_path(path).query_info(
+            'time::modified,time::modified-usec',
+            Gio.FileQueryInfoFlags.NONE,
+            null);
+        const modifiedUs = (info.get_attribute_uint64('time::modified') * 1000000) +
+            info.get_attribute_uint32('time::modified-usec');
+
+        return GLib.get_real_time() - modifiedUs >= MIN_UNIX_SOCKET_AGE_US;
+    } catch {
+        return true;
+    }
 }
 
 function readConfiguredJsonSocket() {
