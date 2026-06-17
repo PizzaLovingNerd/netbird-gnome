@@ -2,6 +2,8 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import {
+    netbird_daemon_update,
+    netbird_daemon_update_result,
     netbird_deregister,
     netbird_debug_bundle,
     netbird_down,
@@ -45,6 +47,13 @@ const tests = [
     ['netbird_debug_bundle', () => netbird_debug_bundle({timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_debug_bundle with cancellable', () =>
         netbird_debug_bundle(withCancellable())],
+    ['netbird_daemon_update', () => netbird_daemon_update({timeoutMs: TEST_TIMEOUT_MS})],
+    ['netbird_daemon_update with cancellable', () =>
+        netbird_daemon_update(withCancellable())],
+    ['netbird_daemon_update_result', () =>
+        netbird_daemon_update_result({timeoutMs: TEST_TIMEOUT_MS})],
+    ['netbird_daemon_update_result with cancellable', () =>
+        netbird_daemon_update_result(withCancellable())],
     ['netbird_down', () => netbird_down({timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_down with cancellable', () => netbird_down(withCancellable())],
     ['netbird_status', () => netbird_status({timeoutMs: TEST_TIMEOUT_MS})],
@@ -69,6 +78,10 @@ const tests = [
         assertStatusProfileName(
             '{"daemonStatus":"Connected","profileName":"Work Profile"}',
             'Work Profile')],
+    ['netbird_status daemon version', () =>
+        assertStatusDaemonVersion(
+            '{"daemonStatus":"Connected","daemonVersion":"0.72.3"}',
+            '0.72.3')],
     ['netbird_profile_list', () => netbird_profile_list({timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_profile_list with cancellable', () => netbird_profile_list(withCancellable())],
     ['netbird_profile_add', () => netbird_profile_add('Test Profile', {timeoutMs: TEST_TIMEOUT_MS})],
@@ -128,6 +141,17 @@ async function assertStatusProfileName(statusJson, expected) {
     } finally {
         GLib.unsetenv('NETBIRD_FAKE_STATUS_JSON');
         GLib.unsetenv('NETBIRD_FAKE_ACTIVE_PROFILE');
+    }
+}
+
+async function assertStatusDaemonVersion(statusJson, expected) {
+    GLib.setenv('NETBIRD_FAKE_STATUS_JSON', statusJson, true);
+    try {
+        const status = await netbird_status({timeoutMs: TEST_TIMEOUT_MS});
+        if (status.daemonVersion !== expected)
+            throw new Error(`expected daemonVersion=${expected}, got ${status.daemonVersion}`);
+    } finally {
+        GLib.unsetenv('NETBIRD_FAKE_STATUS_JSON');
     }
 }
 
@@ -229,12 +253,19 @@ class FakeNetBirdJsonServer {
             'AddProfile',
             'DebugBundle',
             'Down',
+            'GetInstallerResult',
             'Logout',
             'RemoveProfile',
             'SwitchProfile',
+            'TriggerUpdate',
             'Up',
         ].includes(method)) {
-            return {statusCode: 200, body: {}};
+            return {
+                statusCode: 200,
+                body: ['GetInstallerResult', 'TriggerUpdate'].includes(method)
+                    ? {success: true}
+                    : {},
+            };
         }
 
         return {

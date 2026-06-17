@@ -12,6 +12,7 @@ import {confirmProfileDeregister, promptProfileName} from './profile-add-dialog.
 import {getActiveProfileConfigPath, getServiceParamsPath} from './profileConfig.js';
 import {ensureSaveAccessBeforeApply} from './privilegedConfig.js';
 import {GENERAL_PAGE_TITLE, SettingsManager} from './settingsManager.js';
+import {setNetBirdWindowIcon} from './windowIcon.js';
 
 
 const NETBIRD_PROFILE_TIMEOUT_MS = 30000;
@@ -24,6 +25,7 @@ export function createSettingsWindow(application) {
         default_width: 860,
         default_height: 600,
     });
+    setNetBirdWindowIcon(window);
 
     const settings = new SettingsManager();
     const toastOverlay = new Adw.ToastOverlay();
@@ -362,7 +364,10 @@ function createPage(pageDefinition, settings, {
             const row = createRow(rowDefinition, settings);
             if (controller && rowDefinition.key) {
                 controller.rowsByKey.set(rowDefinition.key, row);
-                bindRowToSettings(rowDefinition, row, settings, controller, {stack});
+                bindRowToSettings(rowDefinition, row, settings, controller, {
+                    stack,
+                    toastOverlay,
+                });
             }
 
             group.add(row);
@@ -620,6 +625,7 @@ function createRow(rowDefinition, settings) {
 
 function bindRowToSettings(rowDefinition, row, settings, controller, {
     stack = null,
+    toastOverlay = null,
 } = {}) {
     switch (rowDefinition.type) {
     case 'switch':
@@ -639,7 +645,7 @@ function bindRowToSettings(rowDefinition, row, settings, controller, {
                 return;
             }
 
-            await activateSetting(rowDefinition, row, settings);
+            await activateSetting(rowDefinition, row, settings, toastOverlay);
         });
         break;
     case 'entry':
@@ -662,16 +668,35 @@ function bindRowToSettings(rowDefinition, row, settings, controller, {
     }
 }
 
-async function activateSetting(rowDefinition, row, settings) {
+async function activateSetting(rowDefinition, row, settings, toastOverlay = null) {
+    const previousSubtitle = row.subtitle ?? '';
     row.sensitive = false;
 
     try {
-        await settings.activate(rowDefinition.key);
+        const result = await settings.activate(rowDefinition.key);
+        const message = formatActionResult(rowDefinition, result);
+        if (message && row.subtitle !== undefined)
+            row.subtitle = message;
+        if (message)
+            showToast(toastOverlay, message);
     } catch (error) {
         console.warn(`Failed to activate ${rowDefinition.key}: ${error}`);
+        if (row.subtitle !== undefined)
+            row.subtitle = previousSubtitle;
+        showToast(toastOverlay, `Failed to ${rowDefinition.title.toLowerCase()}`);
     } finally {
         row.sensitive = settings.supportsAction(rowDefinition.key);
     }
+}
+
+function formatActionResult(rowDefinition, result) {
+    if (rowDefinition.key === 'updateDaemon')
+        return result?.message || 'Daemon update request completed';
+
+    if (rowDefinition.key === 'createDebugBundle')
+        return 'Debug bundle created';
+
+    return result?.message ?? '';
 }
 
 function loadSettingsValues(settings, controller) {

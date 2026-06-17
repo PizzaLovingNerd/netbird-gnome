@@ -37,6 +37,32 @@ export async function netbird_debug_bundle({
     }, {cancellable, timeoutMs});
 }
 
+export async function netbird_daemon_update({
+    cancellable = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+    const result = await callNetBird('TriggerUpdate', {}, {cancellable, timeoutMs});
+    const response = normalizeUpdateResponse(result.data);
+
+    return {
+        ...result,
+        ...response,
+    };
+}
+
+export async function netbird_daemon_update_result({
+    cancellable = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+    const result = await callNetBird('GetInstallerResult', {}, {cancellable, timeoutMs});
+    const response = normalizeUpdateResponse(result.data);
+
+    return {
+        ...result,
+        ...response,
+    };
+}
+
 export async function netbird_deregister(profileName = '', {
     cancellable = null,
     timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -371,6 +397,7 @@ function parseStatus(output, activeProfile = '') {
 
     return {
         connected,
+        daemonVersion: normalizeDaemonVersion(details),
         details,
         profileName,
         status,
@@ -449,6 +476,24 @@ function normalizeProfileName(value) {
     return '';
 }
 
+function normalizeDaemonVersion(value) {
+    if (!value || typeof value !== 'object')
+        return '';
+
+    const candidates = [
+        value.daemonVersion,
+        value.DaemonVersion,
+        value.daemon_version,
+    ];
+
+    for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate)
+            return candidate;
+    }
+
+    return '';
+}
+
 function normalizeConnected(details, status) {
     if (isConnectedStatus(status))
         return true;
@@ -501,6 +546,19 @@ function findConnectedBoolean(value) {
         return connectedStates.every(Boolean);
 
     return null;
+}
+
+function normalizeUpdateResponse(data) {
+    const success = Boolean(data?.success ?? data?.Success);
+    const errorMessage = String(data?.errorMsg ?? data?.error_msg ?? data?.ErrorMsg ?? '').trim();
+
+    return {
+        errorMessage,
+        message: success
+            ? 'Daemon update started'
+            : errorMessage || 'No daemon update was started',
+        success,
+    };
 }
 
 function isConnectedStatus(status) {

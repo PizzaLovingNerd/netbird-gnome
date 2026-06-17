@@ -59,6 +59,12 @@ export const SETTINGS_PAGES = [
                         title: 'Create Debug Bundle',
                         subtitle: 'Collect logs and diagnostics for troubleshooting',
                     },
+                    {
+                        key: 'updateDaemon',
+                        type: 'action',
+                        title: 'Update Daemon',
+                        subtitle: 'Install a pending NetBird daemon update',
+                    },
                 ],
             },
         ],

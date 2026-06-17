@@ -1,8 +1,6 @@
 {
   "name": "NetBird for GNOME",
-  "description": "NetBird quick setting for GNOME",
+  "description": "NetBird Quick Setting for GNOME",
   "uuid": "gnome@netbird.io",
-  "shell-version": [
-    "47"
-  ]
+  "shell-version": ["47", "48", "49", "50"]
 }

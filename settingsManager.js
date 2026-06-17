@@ -1,5 +1,6 @@
 import {SETTINGS_PAGES} from './settings.js';
 import {
+    netbird_daemon_update,
     netbird_debug_bundle,
     netbird_down,
     netbird_profile_select,
@@ -26,6 +27,7 @@ const NETBIRD_SETTINGS_QUERY_TIMEOUT_MS = 5000;
 
 const ACTION_HANDLERS = {
     createDebugBundle: netbird_debug_bundle,
+    updateDaemon: netbird_daemon_update,
 };
 
 const NETBIRD_SETTINGS = {
@@ -232,7 +234,7 @@ export class SettingsManager {
         if (!handler)
             return;
 
-        await handler({
+        return await handler({
             timeoutMs: NETBIRD_SETTINGS_TIMEOUT_MS,
         });
     }

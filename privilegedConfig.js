@@ -6,7 +6,17 @@ import {presentAlertDialog} from './profile-add-dialog.js';
 
 
 export const POLKIT_POLICY_PATH = '/usr/share/polkit-1/actions/io.netbird.gnome.policy';
-export const PRIVILEGED_HELPER_PATH = '/usr/libexec/netbird-gnome-config-write';
+export const PRIVILEGED_HELPER_PATH = '/var/lib/netbird-gnome/netbird-gnome-config-write';
+const LEGACY_PRIVILEGED_HELPER_PATH = '/usr/libexec/netbird-gnome-config-write';
+const ALLOWED_CONFIG_PREFIXES = ['/var/lib/netbird', '/etc/netbird'];
+const GENERIC_PKEXEC_READ_COMMANDS = [
+    '/usr/bin/cat',
+    '/bin/cat',
+];
+const GENERIC_PKEXEC_WRITE_COMMANDS = [
+    '/usr/bin/install',
+    '/bin/install',
+];
 
 const INSTALL_SCRIPT_NAME = 'install-netbird-gnome-polkit.sh';
 const EXTENSION_DIR_ENV = 'NETBIRD_GNOME_EXTENSION_DIR';
@@ -41,8 +51,8 @@ export function getInstallScriptPath() {
 }
 
 export function isPrivilegedBackendInstalled() {
-    return GLib.file_test(POLKIT_POLICY_PATH, GLib.FileTest.EXISTS) &&
-        GLib.file_test(PRIVILEGED_HELPER_PATH, GLib.FileTest.IS_EXECUTABLE);
+    return Boolean(getInstalledPrivilegedHelperPath()) ||
+        genericPkexecBackendAvailable();
 }
 
 export function isPathUserWritable(path) {
@@ -78,6 +88,9 @@ export async function ensureSaveAccessBeforeApply(parent, paths) {
     if (isPrivilegedBackendInstalled())
         return true;
 
+    if (genericPkexecBackendAvailable())
+        return true;
+
     return promptInstallPrivilegedBackend({parent});
 }
 
@@ -92,8 +105,15 @@ export function isPermissionError(error) {
 }
 
 export function readJsonFilePrivileged(path) {
+    assertAllowedConfigPath(path);
+
+    const helperPath = getInstalledPrivilegedHelperPath();
+    const argv = helperPath
+        ? ['pkexec', helperPath, 'read', path]
+        : ['pkexec', getGenericReadCommand(), path];
+
     const subprocess = Gio.Subprocess.new(
-        ['pkexec', PRIVILEGED_HELPER_PATH, 'read', path],
+        argv,
         Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
 
     const [, stdout, stderr] = subprocess.communicate_utf8(null, null);
@@ -109,6 +129,8 @@ export function readJsonFilePrivileged(path) {
 }
 
 export async function writeJsonFilePrivileged(path, data) {
+    assertAllowedConfigPath(path);
+
     const tempPath = GLib.build_filenamev([
         GLib.get_tmp_dir(),
         `netbird-gnome-${GLib.uuid_string_random()}.json`,
@@ -119,13 +141,96 @@ export async function writeJsonFilePrivileged(path, data) {
     GLib.file_set_contents(tempPath, bytes);
 
     try {
-        await runPkexec([PRIVILEGED_HELPER_PATH, 'write', path, tempPath]);
+        const helperPath = getInstalledPrivilegedHelperPath();
+        if (helperPath) {
+            await runPkexec([helperPath, 'write', path, tempPath]);
+        } else {
+            await runPkexec([
+                getGenericWriteCommand(),
+                '-Dm600',
+                '-o',
+                'root',
+                '-g',
+                'root',
+                tempPath,
+                path,
+            ]);
+        }
     } finally {
         try {
             GLib.unlink(tempPath);
         } catch {
             // Temp file may already be gone.
         }
+    }
+}
+
+function getInstalledPrivilegedHelperPath() {
+    for (const helperPath of [PRIVILEGED_HELPER_PATH, LEGACY_PRIVILEGED_HELPER_PATH]) {
+        if (GLib.file_test(helperPath, GLib.FileTest.IS_EXECUTABLE) &&
+            policyAllowsHelper(helperPath))
+            return helperPath;
+    }
+
+    return '';
+}
+
+function policyAllowsHelper(helperPath) {
+    if (!GLib.file_test(POLKIT_POLICY_PATH, GLib.FileTest.EXISTS))
+        return false;
+
+    try {
+        const [ok, contents] = GLib.file_get_contents(POLKIT_POLICY_PATH);
+        if (!ok)
+            return false;
+
+        return new TextDecoder().decode(contents).includes(
+            `<annotate key="org.freedesktop.policykit.exec.path">${helperPath}</annotate>`);
+    } catch {
+        return false;
+    }
+}
+
+function genericPkexecBackendAvailable() {
+    return Boolean(GLib.find_program_in_path('pkexec')) &&
+        Boolean(findExistingExecutable(GENERIC_PKEXEC_READ_COMMANDS)) &&
+        Boolean(findExistingExecutable(GENERIC_PKEXEC_WRITE_COMMANDS));
+}
+
+function getGenericReadCommand() {
+    const command = findExistingExecutable(GENERIC_PKEXEC_READ_COMMANDS);
+    if (!command)
+        throw new Error('Unable to find cat for privileged NetBird config reads');
+
+    return command;
+}
+
+function getGenericWriteCommand() {
+    const command = findExistingExecutable(GENERIC_PKEXEC_WRITE_COMMANDS);
+    if (!command)
+        throw new Error('Unable to find install for privileged NetBird config writes');
+
+    return command;
+}
+
+function findExistingExecutable(paths) {
+    return paths.find(path => GLib.file_test(path, GLib.FileTest.IS_EXECUTABLE)) ?? '';
+}
+
+function assertAllowedConfigPath(path) {
+    const realPath = canonicalizePath(path);
+    if (ALLOWED_CONFIG_PREFIXES.some(prefix =>
+        realPath === prefix || realPath.startsWith(`${prefix}/`)))
+        return;
+
+    throw new Error(`Refusing privileged access outside NetBird config directories: ${path}`);
+}
+
+function canonicalizePath(path) {
+    try {
+        return GLib.canonicalize_filename(path, null);
+    } catch {
+        return path;
     }
 }
 
