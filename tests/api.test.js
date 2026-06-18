@@ -11,6 +11,7 @@ import {
     netbird_profile_list,
     netbird_profile_remove,
     netbird_profile_select,
+    netbird_set_config,
     netbird_status,
     netbird_up,
 } from '../api/index.js';
@@ -82,6 +83,10 @@ const tests = [
         assertStatusDaemonVersion(
             '{"daemonStatus":"Connected","daemonVersion":"0.72.3"}',
             '0.72.3')],
+    ['netbird_status update available', () =>
+        assertStatusUpdateAvailable(
+            '{"daemonStatus":"Idle","updateAvailable":true}',
+            true)],
     ['netbird_profile_list', () => netbird_profile_list({timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_profile_list with cancellable', () => netbird_profile_list(withCancellable())],
     ['netbird_profile_add', () => netbird_profile_add('Test Profile', {timeoutMs: TEST_TIMEOUT_MS})],
@@ -93,6 +98,11 @@ const tests = [
     ['netbird_profile_select', () => netbird_profile_select('Work Profile', {timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_profile_select with cancellable', () =>
         netbird_profile_select('Work Profile', withCancellable())],
+    ['netbird_set_config', () =>
+        netbird_set_config({
+            profileName: 'Work Profile',
+            disableAutoConnect: true,
+        }, {timeoutMs: TEST_TIMEOUT_MS})],
 ];
 
 
@@ -150,6 +160,17 @@ async function assertStatusDaemonVersion(statusJson, expected) {
         const status = await netbird_status({timeoutMs: TEST_TIMEOUT_MS});
         if (status.daemonVersion !== expected)
             throw new Error(`expected daemonVersion=${expected}, got ${status.daemonVersion}`);
+    } finally {
+        GLib.unsetenv('NETBIRD_FAKE_STATUS_JSON');
+    }
+}
+
+async function assertStatusUpdateAvailable(statusJson, expected) {
+    GLib.setenv('NETBIRD_FAKE_STATUS_JSON', statusJson, true);
+    try {
+        const status = await netbird_status({timeoutMs: TEST_TIMEOUT_MS});
+        if (status.updateAvailable !== expected)
+            throw new Error(`expected updateAvailable=${expected}, got ${status.updateAvailable}`);
     } finally {
         GLib.unsetenv('NETBIRD_FAKE_STATUS_JSON');
     }
@@ -256,10 +277,20 @@ class FakeNetBirdJsonServer {
             'GetInstallerResult',
             'Logout',
             'RemoveProfile',
+            'SetConfig',
             'SwitchProfile',
             'TriggerUpdate',
             'Up',
         ].includes(method)) {
+            if (method === 'SetConfig') {
+                if (request.body.profileName !== 'Work Profile')
+                    throw new Error(`unexpected profileName: ${request.body.profileName}`);
+                if (request.body.disableAutoConnect !== true)
+                    throw new Error('expected disableAutoConnect=true');
+                if (!request.body.username)
+                    throw new Error('expected username');
+            }
+
             return {
                 statusCode: 200,
                 body: ['GetInstallerResult', 'TriggerUpdate'].includes(method)

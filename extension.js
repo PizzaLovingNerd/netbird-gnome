@@ -47,10 +47,12 @@ const NETBIRD_APPLICATION_NAME = 'NetBird for GNOME';
 const NETBIRD_VPN_TOGGLE_NAMES = /\b(netbird|wiretrustee|wt0)\b/i;
 
 const NETBIRD_STATUS_ICON_FILES = {
-    connected: 'netbird-systemtray-connected-symbolic.svg',
-    connecting: 'netbird-systemtray-connecting-symbolic.svg',
-    disconnected: 'netbird-systemtray-disconnected-symbolic.svg',
-    error: 'netbird-systemtray-error-symbolic.svg',
+    connected: 'netbird-systemtray-connected-macos.svg',
+    connecting: 'netbird-systemtray-connecting-macos.svg',
+    disconnected: 'netbird-systemtray-disconnected-macos.svg',
+    error: 'netbird-systemtray-error-macos.svg',
+    updateConnected: 'netbird-systemtray-update-connected-macos.svg',
+    updateDisconnected: 'netbird-systemtray-update-disconnected-macos.svg',
 };
 
 
@@ -116,9 +118,14 @@ class NetBirdToggle extends QuickMenuToggle {
         this._initialRefreshSourceIds = [];
         this._menuOpenSignalId = 0;
         this._lastConnectedStatus = false;
+        this._lastUpdateAvailable = false;
         this._lastErrorNotificationUs = 0;
 
-        this._setIconState('disconnected');
+        this._setStatusIcon({
+            connected: false,
+            panelVisible: false,
+            updateAvailable: false,
+        });
         this._setHeader(null);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -594,9 +601,10 @@ class NetBirdToggle extends QuickMenuToggle {
             return;
 
         if (!netbird_json_api_available()) {
-            this._setJsonApiUnavailableState();
             this._lastConnectedStatus = false;
+            this._lastUpdateAvailable = false;
             this._setCheckedFromStatus(false);
+            this._setJsonApiUnavailableState();
             return;
         }
 
@@ -628,12 +636,18 @@ class NetBirdToggle extends QuickMenuToggle {
             this.checked = checked;
         this._settingCheckedFromStatus = false;
 
-        this._setIconState(checked ? 'connected' : 'disconnected');
-        this._indicator.visible = true;
+        if (this._hasError)
+            return;
+
+        this._setStatusIcon({
+            connected: checked,
+            updateAvailable: this._lastUpdateAvailable,
+        });
     }
 
     _syncFromStatus(status) {
         this._lastConnectedStatus = status.connected;
+        this._lastUpdateAvailable = Boolean(status.updateAvailable);
         this._setCheckedFromStatus(status.connected);
 
         if (status.profileName)
@@ -645,6 +659,7 @@ class NetBirdToggle extends QuickMenuToggle {
         if (status.status.toLowerCase() === 'connecting') {
             this._connectingFromStatus = true;
             this._setIconState('connecting');
+            this._indicator.visible = true;
             this.subtitle = 'Connecting...';
             return;
         }
@@ -676,6 +691,19 @@ class NetBirdToggle extends QuickMenuToggle {
         this._setHeader(this._headerSubtitle);
     }
 
+    _setStatusIcon({
+        connected = this._lastConnectedStatus,
+        panelVisible = null,
+        updateAvailable = this._lastUpdateAvailable,
+    } = {}) {
+        const state = updateAvailable
+            ? connected ? 'updateConnected' : 'updateDisconnected'
+            : connected ? 'connected' : 'disconnected';
+
+        this._setIconState(state);
+        this._indicator.visible = panelVisible ?? (connected || updateAvailable);
+    }
+
     _selectProfileName(profileName) {
         let selectedItem = null;
         for (const item of this._profileItems) {
@@ -700,7 +728,7 @@ class NetBirdToggle extends QuickMenuToggle {
             return;
 
         this._hasError = false;
-        this._setIconState(this._lastConnectedStatus ? 'connected' : 'disconnected');
+        this._setStatusIcon();
         this.subtitle = this._selectedProfileName;
     }
 
@@ -766,7 +794,7 @@ class NetBirdIndicator extends SystemIndicator {
         this._destroyed = false;
         this._indicator = this._addIndicator();
         this._indicator.gicon = icons.disconnected;
-        this._indicator.visible = true;
+        this._indicator.visible = false;
 
         const toggle = new NetBirdToggle(extension, icons, this._indicator);
         this.quickSettingsItems.push(toggle);
@@ -791,6 +819,8 @@ export default class NetBirdExtension extends Extension {
         super(metadata);
 
         this._indicator = null;
+        this._networksWindowProcess = null;
+        this._settingsWindowProcess = null;
         this._vpnDownCancellable = null;
         this._vpnDownInProgress = false;
         this._vpnPatchToken = {};
@@ -803,29 +833,41 @@ export default class NetBirdExtension extends Extension {
         this._ensureDesktopFile();
 
         const settingsWindow = this.dir.get_child('settings-window.js').get_path();
-        const gjs = GLib.find_program_in_path('gjs') ?? 'gjs';
-
-        try {
-            const launcher = new Gio.SubprocessLauncher({});
-            launcher.setenv('NETBIRD_GNOME_EXTENSION_DIR', this.dir.get_path(), true);
-            launcher.spawnv([gjs, '-m', settingsWindow]);
-        } catch (error) {
-            Main.notify('NetBird', `Failed to open settings: ${formatErrorMessage(error)}`);
-        }
+        this._openTrackedWindow('_settingsWindowProcess', settingsWindow, 'settings');
     }
 
     openNetworksWindow() {
         this._ensureDesktopFile();
 
         const networksWindow = this.dir.get_child('networks-window.js').get_path();
+        this._openTrackedWindow('_networksWindowProcess', networksWindow, 'networks');
+    }
+
+    _openTrackedWindow(processProperty, windowPath, label) {
+        const existingProcess = this[processProperty];
+        if (existingProcess && !existingProcess.get_if_exited())
+            return;
+
         const gjs = GLib.find_program_in_path('gjs') ?? 'gjs';
 
         try {
             const launcher = new Gio.SubprocessLauncher({});
             launcher.setenv('NETBIRD_GNOME_EXTENSION_DIR', this.dir.get_path(), true);
-            launcher.spawnv([gjs, '-m', networksWindow]);
+            const process = launcher.spawnv([gjs, '-m', windowPath]);
+            this[processProperty] = process;
+
+            process.wait_async(null, (subprocess, result) => {
+                try {
+                    subprocess.wait_finish(result);
+                } catch (error) {
+                    console.warn(`Failed to watch NetBird ${label} window process: ${error}`);
+                } finally {
+                    if (this[processProperty] === subprocess)
+                        this[processProperty] = null;
+                }
+            });
         } catch (error) {
-            Main.notify('NetBird', `Failed to open networks: ${formatErrorMessage(error)}`);
+            Main.notify('NetBird', `Failed to open ${label}: ${formatErrorMessage(error)}`);
         }
     }
 

@@ -5,7 +5,7 @@ ACTION="${1:-}"
 TARGET="${2:-}"
 SOURCE="${3:-}"
 
-HELPER_NAME="netbird-gnome-config-write"
+HELPER_NAME="$(basename "$0")"
 ALLOWED_PREFIXES=("/var/lib/netbird" "/etc/netbird")
 
 usage() {
@@ -33,6 +33,15 @@ is_allowed_path() {
 }
 
 [[ -n "${ACTION}" && -n "${TARGET}" ]] || usage
+
+case "${HELPER_NAME}:${ACTION}" in
+    netbird-gnome-config-read:read|netbird-gnome-config-write:write)
+        ;;
+    *)
+        echo "${HELPER_NAME}: action '${ACTION}' is not allowed for this helper" >&2
+        exit 1
+        ;;
+esac
 
 if ! is_allowed_path "${TARGET}"; then
     echo "${HELPER_NAME}: refusing path outside NetBird config directories: ${TARGET}" >&2

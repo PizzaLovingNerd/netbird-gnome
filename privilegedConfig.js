@@ -7,16 +7,10 @@ import {presentAlertDialog} from './profile-add-dialog.js';
 
 export const POLKIT_POLICY_PATH = '/usr/share/polkit-1/actions/io.netbird.gnome.policy';
 export const PRIVILEGED_HELPER_PATH = '/var/lib/netbird-gnome/netbird-gnome-config-write';
+export const PRIVILEGED_READ_HELPER_PATH = '/var/lib/netbird-gnome/netbird-gnome-config-read';
 const LEGACY_PRIVILEGED_HELPER_PATH = '/usr/libexec/netbird-gnome-config-write';
+const LEGACY_PRIVILEGED_READ_HELPER_PATH = '/usr/libexec/netbird-gnome-config-read';
 const ALLOWED_CONFIG_PREFIXES = ['/var/lib/netbird', '/etc/netbird'];
-const GENERIC_PKEXEC_READ_COMMANDS = [
-    '/usr/bin/cat',
-    '/bin/cat',
-];
-const GENERIC_PKEXEC_WRITE_COMMANDS = [
-    '/usr/bin/install',
-    '/bin/install',
-];
 
 const INSTALL_SCRIPT_NAME = 'install-netbird-gnome-polkit.sh';
 const EXTENSION_DIR_ENV = 'NETBIRD_GNOME_EXTENSION_DIR';
@@ -51,8 +45,15 @@ export function getInstallScriptPath() {
 }
 
 export function isPrivilegedBackendInstalled() {
-    return Boolean(getInstalledPrivilegedHelperPath()) ||
-        genericPkexecBackendAvailable();
+    return isPrivilegedWriteBackendInstalled() || isPrivilegedReadBackendInstalled();
+}
+
+export function isPrivilegedReadBackendInstalled() {
+    return Boolean(getInstalledPrivilegedReadHelperPath());
+}
+
+export function isPrivilegedWriteBackendInstalled() {
+    return Boolean(getInstalledPrivilegedWriteHelperPath());
 }
 
 export function isPathUserWritable(path) {
@@ -68,6 +69,15 @@ export function isPathUserWritable(path) {
     return fileHasAccess(parent, 'can-write');
 }
 
+export function isPathUserReadable(path) {
+    const file = Gio.File.new_for_path(path);
+
+    if (GLib.file_test(path, GLib.FileTest.EXISTS))
+        return fileHasAccess(file, 'can-read');
+
+    return false;
+}
+
 function fileHasAccess(file, attribute) {
     try {
         const info = file.query_info(`access::${attribute}`, Gio.FileQueryInfoFlags.NONE);
@@ -81,14 +91,20 @@ export function needsPrivilegedAccessForPaths(paths) {
     return paths.some(path => !isPathUserWritable(path));
 }
 
+export function needsPrivilegedReadAccessForPaths(paths) {
+    return paths.some(path => !isPathUserReadable(path));
+}
+
 export async function ensureSaveAccessBeforeApply(parent, paths) {
-    if (!needsPrivilegedAccessForPaths(paths))
+    const needsReadAccess = needsPrivilegedReadAccessForPaths(paths);
+    const needsWriteAccess = needsPrivilegedAccessForPaths(paths);
+
+    if (!needsReadAccess && !needsWriteAccess)
         return true;
 
-    if (isPrivilegedBackendInstalled())
-        return true;
-
-    if (genericPkexecBackendAvailable())
+    const canRead = !needsReadAccess || isPrivilegedReadBackendInstalled();
+    const canWrite = !needsWriteAccess || isPrivilegedWriteBackendInstalled();
+    if (canRead && canWrite)
         return true;
 
     return promptInstallPrivilegedBackend({parent});
@@ -107,13 +123,12 @@ export function isPermissionError(error) {
 export function readJsonFilePrivileged(path) {
     assertAllowedConfigPath(path);
 
-    const helperPath = getInstalledPrivilegedHelperPath();
-    const argv = helperPath
-        ? ['pkexec', helperPath, 'read', path]
-        : ['pkexec', getGenericReadCommand(), path];
+    const helperPath = getInstalledPrivilegedReadHelperPath();
+    if (!helperPath)
+        throw new Error('NetBird PolicyKit read helper is not installed');
 
     const subprocess = Gio.Subprocess.new(
-        argv,
+        ['pkexec', helperPath, 'read', path],
         Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
 
     const [, stdout, stderr] = subprocess.communicate_utf8(null, null);
@@ -141,21 +156,11 @@ export async function writeJsonFilePrivileged(path, data) {
     GLib.file_set_contents(tempPath, bytes);
 
     try {
-        const helperPath = getInstalledPrivilegedHelperPath();
-        if (helperPath) {
-            await runPkexec([helperPath, 'write', path, tempPath]);
-        } else {
-            await runPkexec([
-                getGenericWriteCommand(),
-                '-Dm600',
-                '-o',
-                'root',
-                '-g',
-                'root',
-                tempPath,
-                path,
-            ]);
-        }
+        const helperPath = getInstalledPrivilegedWriteHelperPath();
+        if (!helperPath)
+            throw new Error('NetBird PolicyKit write helper is not installed');
+
+        await runPkexec([helperPath, 'write', path, tempPath]);
     } finally {
         try {
             GLib.unlink(tempPath);
@@ -166,7 +171,25 @@ export async function writeJsonFilePrivileged(path, data) {
 }
 
 function getInstalledPrivilegedHelperPath() {
-    for (const helperPath of [PRIVILEGED_HELPER_PATH, LEGACY_PRIVILEGED_HELPER_PATH]) {
+    return getInstalledPrivilegedWriteHelperPath() || getInstalledPrivilegedReadHelperPath();
+}
+
+function getInstalledPrivilegedReadHelperPath() {
+    return getInstalledHelperPath([
+        PRIVILEGED_READ_HELPER_PATH,
+        LEGACY_PRIVILEGED_READ_HELPER_PATH,
+    ]);
+}
+
+function getInstalledPrivilegedWriteHelperPath() {
+    return getInstalledHelperPath([
+        PRIVILEGED_HELPER_PATH,
+        LEGACY_PRIVILEGED_HELPER_PATH,
+    ]);
+}
+
+function getInstalledHelperPath(helperPaths) {
+    for (const helperPath of helperPaths) {
         if (GLib.file_test(helperPath, GLib.FileTest.IS_EXECUTABLE) &&
             policyAllowsHelper(helperPath))
             return helperPath;
@@ -189,32 +212,6 @@ function policyAllowsHelper(helperPath) {
     } catch {
         return false;
     }
-}
-
-function genericPkexecBackendAvailable() {
-    return Boolean(GLib.find_program_in_path('pkexec')) &&
-        Boolean(findExistingExecutable(GENERIC_PKEXEC_READ_COMMANDS)) &&
-        Boolean(findExistingExecutable(GENERIC_PKEXEC_WRITE_COMMANDS));
-}
-
-function getGenericReadCommand() {
-    const command = findExistingExecutable(GENERIC_PKEXEC_READ_COMMANDS);
-    if (!command)
-        throw new Error('Unable to find cat for privileged NetBird config reads');
-
-    return command;
-}
-
-function getGenericWriteCommand() {
-    const command = findExistingExecutable(GENERIC_PKEXEC_WRITE_COMMANDS);
-    if (!command)
-        throw new Error('Unable to find install for privileged NetBird config writes');
-
-    return command;
-}
-
-function findExistingExecutable(paths) {
-    return paths.find(path => GLib.file_test(path, GLib.FileTest.IS_EXECUTABLE)) ?? '';
 }
 
 function assertAllowedConfigPath(path) {
@@ -251,7 +248,7 @@ export function promptInstallPrivilegedBackend({
     return new Promise(resolve => {
         const dialog = new Adw.AlertDialog({
             heading: 'Install NetBird Permissions?',
-            body: 'Saving NetBird settings requires permission to update files in /var/lib/netbird (and legacy /etc/netbird paths). Install a small PolicyKit rule so you can authenticate when you apply changes.',
+            body: 'NetBird settings need permission to read and update files in /var/lib/netbird (and legacy /etc/netbird paths). Install a small PolicyKit rule so settings can load without a password and authenticate when you apply changes.',
             close_response: 'cancel',
             default_response: 'install',
         });
@@ -269,7 +266,7 @@ export function promptInstallPrivilegedBackend({
 
             try {
                 await installPrivilegedBackend();
-                const installed = isPrivilegedBackendInstalled();
+                const installed = isPrivilegedReadBackendInstalled() && isPrivilegedWriteBackendInstalled();
                 if (installed)
                     onInstalled?.(true);
                 else

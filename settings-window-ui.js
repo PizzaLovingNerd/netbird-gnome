@@ -9,7 +9,6 @@ import {
     netbird_profile_select,
 } from './api/index.js';
 import {confirmProfileDeregister, promptProfileName} from './profile-add-dialog.js';
-import {getActiveProfileConfigPath, getServiceParamsPath} from './profileConfig.js';
 import {ensureSaveAccessBeforeApply} from './privilegedConfig.js';
 import {GENERAL_PAGE_TITLE, SettingsManager} from './settingsManager.js';
 import {setNetBirdWindowIcon} from './windowIcon.js';
@@ -110,10 +109,7 @@ function createApplyController(window, settings, toastOverlay) {
                 this.applyButton.sensitive = false;
 
             try {
-                const savePaths = [
-                    getActiveProfileConfigPath(settings.activeProfileName),
-                    getServiceParamsPath(),
-                ];
+                const savePaths = settings.getPrivilegedSavePaths(changes);
                 const canSave = await ensureSaveAccessBeforeApply(window, savePaths);
                 if (!canSave) {
                     showToast(toastOverlay, 'NetBird permissions are required to save settings');
@@ -582,25 +578,29 @@ function createRow(rowDefinition, settings) {
         ? settings.getValue(rowDefinition.key)
         : rowDefinition.defaultValue;
 
+    let row;
     switch (rowDefinition.type) {
     case 'switch':
-        return new Adw.SwitchRow({
+        row = new Adw.SwitchRow({
             title: rowDefinition.title,
             subtitle: rowDefinition.subtitle ?? '',
             active: Boolean(value),
         });
+        break;
     case 'entry':
-        return new Adw.EntryRow({
+        row = new Adw.EntryRow({
             title: rowDefinition.title,
             text: value ?? '',
         });
+        break;
     case 'password':
-        return new Adw.PasswordEntryRow({
+        row = new Adw.PasswordEntryRow({
             title: rowDefinition.title,
             text: value ?? '',
         });
+        break;
     case 'spin':
-        return new Adw.SpinRow({
+        row = new Adw.SpinRow({
             title: rowDefinition.title,
             subtitle: rowDefinition.subtitle ?? '',
             adjustment: new Gtk.Adjustment({
@@ -613,14 +613,31 @@ function createRow(rowDefinition, settings) {
             climb_rate: 1,
             digits: 0,
         });
+        break;
     case 'action':
-        return new Adw.ActionRow({
+        row = new Adw.ActionRow({
             title: rowDefinition.title,
             subtitle: rowDefinition.subtitle ?? '',
         });
+        break;
     default:
         throw new Error(`Unsupported setting row type: ${rowDefinition.type}`);
     }
+
+    if (rowDefinition.key && settings.requiresPrivilegedSave(rowDefinition.key))
+        addPrivilegedSaveIndicator(row);
+
+    return row;
+}
+
+function addPrivilegedSaveIndicator(row) {
+    const icon = new Gtk.Image({
+        icon_name: 'dialog-password-symbolic',
+        tooltip_text: 'Changing this setting requires authentication when you save.',
+        valign: Gtk.Align.CENTER,
+    });
+
+    row.add_suffix(icon);
 }
 
 function bindRowToSettings(rowDefinition, row, settings, controller, {

@@ -8,7 +8,7 @@
 
   <action id="io.netbird.gnome.write-config">
     <description>Write NetBird configuration</description>
-    <message>Authentication is required to save NetBird settings</message>
+    <message>You are changing a setting that requires authentication</message>
     <icon_name>network-vpn-symbolic</icon_name>
     <defaults>
       <allow_any>no</allow_any>
@@ -21,14 +21,14 @@
 
   <action id="io.netbird.gnome.read-config">
     <description>Read NetBird configuration</description>
-    <message>Authentication is required to read NetBird settings</message>
+    <message>Permission is required to read NetBird settings</message>
     <icon_name>network-vpn-symbolic</icon_name>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
-      <allow_active>auth_self_keep</allow_active>
+      <allow_active>yes</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/var/lib/netbird-gnome/netbird-gnome-config-write</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/var/lib/netbird-gnome/netbird-gnome-config-read</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

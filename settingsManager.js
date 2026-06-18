@@ -4,20 +4,19 @@ import {
     netbird_debug_bundle,
     netbird_down,
     netbird_profile_select,
+    netbird_set_config,
     netbird_status,
     netbird_up,
 } from './api/index.js';
 import {
     getActiveProfileName,
+    getServiceParamsPath,
     MASKED_PRESHARED_KEY,
     readBoolPtr,
     readProfileConfig,
     readServiceParams,
     readUrlValue,
-    writeBoolPtr,
-    writeProfileConfig,
     writeServiceParams,
-    writeUrlValue,
 } from './profileConfig.js';
 
 
@@ -33,87 +32,110 @@ const ACTION_HANDLERS = {
 const NETBIRD_SETTINGS = {
     allowSsh: {
         configKey: 'ServerSSHAllowed',
+        apiKey: 'serverSSHAllowed',
         boolPtr: true,
     },
     connectOnStartup: {
         configKey: 'DisableAutoConnect',
+        apiKey: 'disableAutoConnect',
         inverted: true,
     },
     quantumResistance: {
         configKey: 'RosenpassEnabled',
+        apiKey: 'rosenpassEnabled',
     },
     lazyConnections: {
         configKey: 'LazyConnectionEnabled',
+        apiKey: 'lazyConnectionEnabled',
     },
     blockInboundConnections: {
         configKey: 'BlockInbound',
+        apiKey: 'blockInbound',
     },
     notifications: {
         configKey: 'DisableNotifications',
+        apiKey: 'disableNotifications',
         inverted: true,
         boolPtr: true,
     },
     managementUrl: {
         configKey: 'ManagementURL',
+        apiKey: 'managementUrl',
         type: 'url',
     },
     preSharedKey: {
         configKey: 'PreSharedKey',
+        apiKey: 'optionalPreSharedKey',
         type: 'preSharedKey',
     },
     connectionQuantumResistance: {
         configKey: 'RosenpassPermissive',
+        apiKey: 'rosenpassPermissive',
     },
     interfaceName: {
         configKey: 'WgIface',
+        apiKey: 'interfaceName',
     },
     interfacePort: {
         configKey: 'WgPort',
+        apiKey: 'wireguardPort',
     },
     mtu: {
         configKey: 'MTU',
+        apiKey: 'mtu',
     },
     logFile: {
         type: 'serviceLogFile',
     },
     networkMonitor: {
         configKey: 'NetworkMonitor',
+        apiKey: 'networkMonitor',
         boolPtr: true,
     },
     disableDns: {
         configKey: 'DisableDNS',
+        apiKey: 'disableDns',
     },
     disableClientRoutes: {
         configKey: 'DisableClientRoutes',
+        apiKey: 'disableClientRoutes',
     },
     disableServerRoutes: {
         configKey: 'DisableServerRoutes',
+        apiKey: 'disableServerRoutes',
     },
     disableLanAccess: {
         configKey: 'BlockLANAccess',
+        apiKey: 'blockLanAccess',
     },
     sshRootLogin: {
         configKey: 'EnableSSHRoot',
+        apiKey: 'enableSSHRoot',
         boolPtr: true,
     },
     sshSftp: {
         configKey: 'EnableSSHSFTP',
+        apiKey: 'enableSSHSFTP',
         boolPtr: true,
     },
     sshLocalPortForwarding: {
         configKey: 'EnableSSHLocalPortForwarding',
+        apiKey: 'enableSSHLocalPortForwarding',
         boolPtr: true,
     },
     sshRemotePortForwarding: {
         configKey: 'EnableSSHRemotePortForwarding',
+        apiKey: 'enableSSHRemotePortForwarding',
         boolPtr: true,
     },
     disableSshAuthentication: {
         configKey: 'DisableSSHAuth',
+        apiKey: 'disableSSHAuth',
         boolPtr: true,
     },
     jwtCacheTtl: {
         configKey: 'SSHJWTCacheTTL',
+        apiKey: 'sshJWTCacheTTL',
         intPtr: true,
     },
 };
@@ -174,7 +196,10 @@ export class SettingsManager {
 
     async applyChanges(changes) {
         const profileName = this._activeProfileName;
-        const profileConfig = readProfileConfig(profileName);
+        const setConfigRequest = {
+            profileName,
+        };
+        let profileDirty = false;
         let serviceParams = null;
         let serviceDirty = false;
 
@@ -191,11 +216,20 @@ export class SettingsManager {
                 continue;
             }
 
-            applyProfileConfigValue(profileConfig, handler, value);
+            const apiValue = toSetConfigValue(handler, value);
+            if (apiValue === undefined)
+                continue;
+
+            setConfigRequest[handler.apiKey] = apiValue;
+            profileDirty = true;
             this._values.set(key, value);
         }
 
-        await writeProfileConfig(profileName, profileConfig);
+        if (profileDirty) {
+            await netbird_set_config(setConfigRequest, {
+                timeoutMs: NETBIRD_SETTINGS_TIMEOUT_MS,
+            });
+        }
 
         if (serviceDirty)
             await writeServiceParams(serviceParams);
@@ -272,6 +306,16 @@ export class SettingsManager {
 
     supportsAction(key) {
         return key === 'profile' || Boolean(ACTION_HANDLERS[key]);
+    }
+
+    getPrivilegedSavePaths(changes) {
+        return changes
+            .filter(([key]) => NETBIRD_SETTINGS[key]?.type === 'serviceLogFile')
+            .map(() => getServiceParamsPath());
+    }
+
+    requiresPrivilegedSave(key) {
+        return NETBIRD_SETTINGS[key]?.type === 'serviceLogFile';
     }
 
     reset() {
@@ -355,35 +399,34 @@ function readProfileConfigValue(config, handler) {
     return inverted ? !value : value;
 }
 
-function applyProfileConfigValue(config, handler, value) {
-    const {configKey, inverted = false, boolPtr = false, intPtr = false, type} = handler;
+function toSetConfigValue(handler, value) {
+    const {inverted = false, intPtr = false, type} = handler;
     const storedValue = inverted ? !value : value;
 
-    if (type === 'url') {
-        config[configKey] = writeUrlValue(String(storedValue ?? ''));
-        return;
-    }
+    if (!handler.apiKey)
+        return undefined;
+
+    if (type === 'url')
+        return String(storedValue ?? '');
 
     if (type === 'preSharedKey') {
         const nextValue = String(value ?? '').trim();
         if (!nextValue || nextValue === MASKED_PRESHARED_KEY)
-            return;
+            return undefined;
 
-        config[configKey] = nextValue;
-        return;
+        return nextValue;
     }
 
-    if (intPtr) {
-        config[configKey] = Number(storedValue);
-        return;
-    }
+    if (intPtr)
+        return Number(storedValue);
 
-    if (boolPtr) {
-        writeBoolPtr(config, configKey, storedValue);
-        return;
-    }
+    if (typeof storedValue === 'string')
+        return String(storedValue);
 
-    config[configKey] = Boolean(storedValue);
+    if (typeof storedValue === 'number')
+        return Number(storedValue);
+
+    return Boolean(storedValue);
 }
 
 function readServiceLogFile(serviceParams) {

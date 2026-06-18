@@ -146,6 +146,18 @@ export async function netbird_profile_select(profileName, {
     };
 }
 
+export async function netbird_set_config(config = {}, {
+    cancellable = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+    const result = await callNetBird('SetConfig', {
+        username: currentUsername(),
+        ...config,
+    }, {cancellable, timeoutMs});
+
+    return result;
+}
+
 export async function netbird_status({
     cancellable = null,
     timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -401,6 +413,7 @@ function parseStatus(output, activeProfile = '') {
         details,
         profileName,
         status,
+        updateAvailable: normalizeUpdateAvailable(details),
     };
 }
 
@@ -492,6 +505,59 @@ function normalizeDaemonVersion(value) {
     }
 
     return '';
+}
+
+function normalizeUpdateAvailable(value) {
+    if (!value || typeof value !== 'object')
+        return false;
+
+    const candidates = [
+        value.updateAvailable,
+        value.UpdateAvailable,
+        value.update_available,
+        value.daemonUpdateAvailable,
+        value.DaemonUpdateAvailable,
+        value.daemon_update_available,
+        value.update,
+        value.Update,
+        value.hasUpdate,
+        value.HasUpdate,
+        value.has_update,
+        value.needsUpdate,
+        value.NeedsUpdate,
+        value.needs_update,
+    ];
+
+    for (const candidate of candidates) {
+        if (typeof candidate === 'boolean')
+            return candidate;
+
+        if (typeof candidate === 'string') {
+            const normalized = candidate.trim().toLowerCase();
+            if (['true', 'yes', 'available', 'needed', 'required'].includes(normalized))
+                return true;
+
+            if (['false', 'no', 'none', 'unavailable'].includes(normalized))
+                return false;
+        }
+    }
+
+    const containers = [
+        value.daemon,
+        value.Daemon,
+        value.client,
+        value.Client,
+        typeof value.update === 'object' ? value.update : null,
+        typeof value.Update === 'object' ? value.Update : null,
+        value.updateStatus,
+        value.UpdateStatus,
+        value.update_status,
+        value.updateState,
+        value.UpdateState,
+        value.update_state,
+    ];
+
+    return containers.some(container => normalizeUpdateAvailable(container));
 }
 
 function normalizeConnected(details, status) {

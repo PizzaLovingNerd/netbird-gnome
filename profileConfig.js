@@ -1,9 +1,11 @@
 import GLib from 'gi://GLib';
 
 import {
+    isPathUserReadable,
     isPathUserWritable,
     isPermissionError,
     isPrivilegedBackendInstalled,
+    isPrivilegedReadBackendInstalled,
     readJsonFilePrivileged,
     writeJsonFilePrivileged,
 } from './privilegedConfig.js';
@@ -141,13 +143,13 @@ function sanitizeProfileName(name) {
 }
 
 function readJsonFile(path) {
-    if (shouldUsePrivilegedAccess(path))
+    if (shouldUsePrivilegedReadAccess(path))
         return readJsonFilePrivileged(path);
 
     try {
         return readJsonFileDirect(path);
     } catch (error) {
-        if (!isPermissionError(error) || !isPrivilegedBackendInstalled())
+        if (!isPermissionError(error) || !isPrivilegedReadBackendInstalled())
             throw error;
 
         return readJsonFilePrivileged(path);
@@ -172,6 +174,10 @@ async function writeJsonFile(path, data) {
 
 function shouldUsePrivilegedAccess(path) {
     return isPrivilegedBackendInstalled() && !isPathUserWritable(path);
+}
+
+function shouldUsePrivilegedReadAccess(path) {
+    return isPrivilegedReadBackendInstalled() && !isPathUserReadable(path);
 }
 
 function readJsonFileDirect(path) {
