@@ -134,12 +134,6 @@ export const SETTINGS_PAGES = [
                         lower: 576,
                         upper: 9000,
                     },
-                    {
-                        key: 'logFile',
-                        type: 'entry',
-                        title: 'Log File',
-                        defaultValue: '',
-                    },
                 ],
             },
         ],

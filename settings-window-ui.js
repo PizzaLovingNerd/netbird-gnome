@@ -2,14 +2,14 @@ import Adw from 'gi://Adw?version=1';
 import Gtk from 'gi://Gtk?version=4.0';
 
 import {
+    netbird_json_api_available,
     netbird_deregister,
     netbird_profile_add,
     netbird_profile_list,
     netbird_profile_remove,
     netbird_profile_select,
 } from './api/index.js';
-import {confirmProfileDeregister, promptProfileName} from './profile-add-dialog.js';
-import {ensureSaveAccessBeforeApply} from './privilegedConfig.js';
+import {confirmProfileDeregister, promptProfileName} from './gtkProfileDialogs.js';
 import {GENERAL_PAGE_TITLE, SettingsManager} from './settingsManager.js';
 import {setNetBirdWindowIcon} from './windowIcon.js';
 
@@ -42,8 +42,8 @@ export function createSettingsWindow(application) {
 
     const profileSwitcher = createProfileSwitcher(settings, controller, toastOverlay);
     const onProfilesChanged = async () => {
-        await profileSwitcher.refresh();
-        await settings.loadSettings();
+        const activeProfile = await profileSwitcher.refresh();
+        await settings.loadSettings(activeProfile);
         controller.pendingValues.clear();
         updateApplyButton(controller);
         reloadSettingsValues(settings, controller);
@@ -73,11 +73,30 @@ export function createSettingsWindow(application) {
         toastOverlay,
     ));
 
-    profileSwitcher.refresh().then(() => {
-        loadSettingsValues(settings, controller);
-    });
+    initializeSettings(
+        settings,
+        controller,
+        profileSwitcher,
+        toastOverlay);
 
     return window;
+}
+
+async function initializeSettings(settings, controller, profileSwitcher, toastOverlay) {
+    if (!netbird_json_api_available()) {
+        setRowsSensitive(settings, controller.rowsByKey, false);
+        showToast(toastOverlay, 'NetBird JSON API is unavailable');
+        return;
+    }
+
+    try {
+        const activeProfile = await profileSwitcher.refresh();
+        await loadSettingsValues(settings, controller, activeProfile);
+    } catch (error) {
+        console.warn(`Failed to initialize NetBird settings: ${error}`);
+        setRowsSensitive(settings, controller.rowsByKey, false);
+        showToast(toastOverlay, 'NetBird JSON API is unavailable');
+    }
 }
 
 function createApplyController(window, settings, toastOverlay) {
@@ -109,13 +128,6 @@ function createApplyController(window, settings, toastOverlay) {
                 this.applyButton.sensitive = false;
 
             try {
-                const savePaths = settings.getPrivilegedSavePaths(changes);
-                const canSave = await ensureSaveAccessBeforeApply(window, savePaths);
-                if (!canSave) {
-                    showToast(toastOverlay, 'NetBird permissions are required to save settings');
-                    return;
-                }
-
                 await settings.applyChanges(changes);
                 pendingValues.clear();
                 showToast(toastOverlay, 'Settings saved');
@@ -163,8 +175,12 @@ function createProfileSwitcher(settings, controller, toastOverlay) {
                 this._profileNames = names;
                 profileMenu.set_model(Gtk.StringList.new(names));
 
-                const selectedIndex = Math.max(0, names.indexOf(settings.activeProfileName));
+                const activeProfile = result.activeProfile ||
+                    settings.activeProfileName ||
+                    names[0];
+                const selectedIndex = Math.max(0, names.indexOf(activeProfile));
                 profileMenu.set_selected(selectedIndex);
+                return activeProfile;
             } finally {
                 this._suppressSwitch = false;
             }
@@ -413,6 +429,16 @@ function createProfilesPage(pageDefinition, settings, controller, toastOverlay, 
     };
 
     const refreshProfiles = async () => {
+        if (!netbird_json_api_available()) {
+            addButton.sensitive = false;
+            setProfileRows([
+                createStatusRow(
+                    'NetBird JSON API Unavailable',
+                    'Profile management requires the upcoming NetBird JSON API.'),
+            ]);
+            return;
+        }
+
         if (profileRows.length === 0) {
             setProfileRows([
                 createStatusRow('Loading Profiles', 'Reading NetBird profiles...'),
@@ -502,6 +528,7 @@ function createProfilesPage(pageDefinition, settings, controller, toastOverlay, 
         });
     });
 
+    profilesGroup.add(addRow);
     refreshProfiles();
 
     return page;
@@ -624,20 +651,7 @@ function createRow(rowDefinition, settings) {
         throw new Error(`Unsupported setting row type: ${rowDefinition.type}`);
     }
 
-    if (rowDefinition.key && settings.requiresPrivilegedSave(rowDefinition.key))
-        addPrivilegedSaveIndicator(row);
-
     return row;
-}
-
-function addPrivilegedSaveIndicator(row) {
-    const icon = new Gtk.Image({
-        icon_name: 'dialog-password-symbolic',
-        tooltip_text: 'Changing this setting requires authentication when you save.',
-        valign: Gtk.Align.CENTER,
-    });
-
-    row.add_suffix(icon);
 }
 
 function bindRowToSettings(rowDefinition, row, settings, controller, {
@@ -716,10 +730,9 @@ function formatActionResult(rowDefinition, result) {
     return result?.message ?? '';
 }
 
-function loadSettingsValues(settings, controller) {
-    return settings.loadSettings().then(() => {
-        reloadSettingsValues(settings, controller);
-    });
+async function loadSettingsValues(settings, controller, profileName) {
+    await settings.loadSettings(profileName);
+    reloadSettingsValues(settings, controller);
 }
 
 function reloadSettingsValues(settings, controller) {
@@ -735,7 +748,7 @@ function reloadSettingsValues(settings, controller) {
 }
 
 function setRowValue(row, rowDefinition, value) {
-    // Updating rows from the CLI should not mark them as user edits.
+    // Updating rows from the daemon should not mark them as user edits.
     row._syncingFromSettings = true;
     switch (rowDefinition.type) {
     case 'switch':

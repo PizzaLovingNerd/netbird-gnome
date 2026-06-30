@@ -82,6 +82,56 @@ export async function netbird_down({
     };
 }
 
+export async function netbird_get_config(profileName = '', {
+    cancellable = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+    const result = await callNetBird('GetConfig', {
+        profileName,
+        username: currentUsername(),
+    }, {cancellable, timeoutMs});
+
+    return {
+        ...result,
+        config: result.data ?? {},
+    };
+}
+
+export async function netbird_network_list({
+    cancellable = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+    const result = await callNetBird('ListNetworks', {}, {cancellable, timeoutMs});
+    return {
+        ...result,
+        networks: (result.data?.routes ?? []).map(normalizeNetwork),
+    };
+}
+
+export async function netbird_network_select(networkIds = [], {
+    all = false,
+    append = true,
+    cancellable = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+    return callNetBird('SelectNetworks', {
+        all,
+        append,
+        networkIDs: networkIds,
+    }, {cancellable, timeoutMs});
+}
+
+export async function netbird_network_deselect(networkIds = [], {
+    all = false,
+    cancellable = null,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+} = {}) {
+    return callNetBird('DeselectNetworks', {
+        all,
+        networkIDs: networkIds,
+    }, {cancellable, timeoutMs});
+}
+
 export async function netbird_profile_list({
     cancellable = null,
     timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -193,7 +243,6 @@ export async function netbird_up({
     timeoutMs = DEFAULT_TIMEOUT_MS,
 } = {}) {
     let loginUrl = '';
-    let loginUrlOpened = false;
 
     let result;
     try {
@@ -206,10 +255,8 @@ export async function netbird_up({
         if (!loginUrl)
             throw error;
 
-        if (!loginUrlOpened)
-            onLoginUrlOpen?.(loginUrl);
-
-        if (openLoginUrl && !loginUrlOpened)
+        onLoginUrlOpen?.(loginUrl);
+        if (openLoginUrl)
             launchLoginUrl(loginUrl);
 
         return {
@@ -324,7 +371,6 @@ export async function callNetBird(method, body = {}, {
                 timedOut,
             });
 
-        console.warn(`NetBird JSON API failed: ${method}: ${error}`);
         throw error;
     } finally {
         if (timeoutId)
@@ -361,8 +407,7 @@ async function getActiveProfile({cancellable, timeoutMs}) {
     try {
         const result = await callNetBird('GetActiveProfile', {}, {cancellable, timeoutMs});
         return result.data?.profileName ?? '';
-    } catch (error) {
-        console.warn(`Failed to query NetBird active profile: ${error}`);
+    } catch {
         return '';
     }
 }
@@ -385,6 +430,35 @@ function parseProfileList(data) {
             selected: Boolean(profile.isActive ?? profile.is_active),
         }))
         .filter(profile => profile.name);
+}
+
+function normalizeNetwork(network) {
+    const domains = Array.isArray(network?.domains) ? network.domains : [];
+    const resolvedIps = network?.resolvedIPs && typeof network.resolvedIPs === 'object'
+        ? Object.values(network.resolvedIPs).flatMap(value => {
+            if (Array.isArray(value))
+                return value;
+            if (Array.isArray(value?.ips))
+                return value.ips;
+            return value === undefined || value === null ? [] : [value];
+        })
+        : [];
+    const range = [
+        network?.range,
+        ...domains,
+    ].filter(Boolean).join(', ');
+
+    return {
+        id: String(network?.ID ?? network?.id ?? ''),
+        isExitNode: range
+            .split(/[,\s]+/)
+            .some(value => value === '0.0.0.0/0' || value === '::/0'),
+        overlapping: false,
+        range,
+        resolved: resolvedIps.map(String).join(', '),
+        selected: Boolean(network?.selected),
+        sourcePeer: '',
+    };
 }
 
 function assertProfileName(profileName) {
@@ -654,7 +728,6 @@ function extractLoginUrl(output) {
 function launchLoginUrl(loginUrl) {
     try {
         Gio.AppInfo.launch_default_for_uri(loginUrl, null);
-        console.log(`NetBird login URL opened in browser: ${loginUrl}`);
     } catch (error) {
         console.warn(`Failed to open NetBird login URL: ${error}`);
     }
@@ -686,8 +759,7 @@ function writeAllAsync(stream, bytes, cancellable) {
 }
 
 function readHttpResponse(stream, cancellable) {
-    const decoder = new TextDecoder();
-    let text = '';
+    const responseBytes = [];
     let headerEnd = -1;
     let contentLength = null;
 
@@ -697,22 +769,25 @@ function readHttpResponse(stream, cancellable) {
                 try {
                     const bytes = source.read_bytes_finish(result);
                     if (bytes.get_size() === 0) {
-                        resolve(parseResponse(text));
+                        resolve(parseResponse(new Uint8Array(responseBytes)));
                         return;
                     }
 
-                    text += decoder.decode(bytes.toArray());
+                    responseBytes.push(...bytes.toArray());
 
                     if (headerEnd === -1) {
-                        headerEnd = text.indexOf('\r\n\r\n');
-                        if (headerEnd !== -1)
-                            contentLength = parseContentLength(text.slice(0, headerEnd));
+                        headerEnd = findHeaderEnd(responseBytes);
+                        if (headerEnd !== -1) {
+                            const headerText = new TextDecoder().decode(
+                                new Uint8Array(responseBytes.slice(0, headerEnd)));
+                            contentLength = parseContentLength(headerText);
+                        }
                     }
 
                     if (headerEnd !== -1 && contentLength !== null) {
-                        const body = text.slice(headerEnd + 4);
-                        if (new TextEncoder().encode(body).length >= contentLength) {
-                            resolve(parseResponse(text));
+                        const bodyLength = responseBytes.length - (headerEnd + 4);
+                        if (bodyLength >= contentLength) {
+                            resolve(parseResponse(new Uint8Array(responseBytes)));
                             return;
                         }
                     }
@@ -728,13 +803,26 @@ function readHttpResponse(stream, cancellable) {
     });
 }
 
-function parseResponse(text) {
-    const headerEnd = text.indexOf('\r\n\r\n');
+function findHeaderEnd(bytes) {
+    for (let index = 0; index <= bytes.length - 4; index++) {
+        if (bytes[index] === 13 &&
+            bytes[index + 1] === 10 &&
+            bytes[index + 2] === 13 &&
+            bytes[index + 3] === 10)
+            return index;
+    }
+
+    return -1;
+}
+
+function parseResponse(bytes) {
+    const headerEnd = findHeaderEnd(bytes);
     if (headerEnd === -1)
         throw new Error('Invalid NetBird JSON API response');
 
-    const headerText = text.slice(0, headerEnd);
-    let body = text.slice(headerEnd + 4);
+    const decoder = new TextDecoder();
+    const headerText = decoder.decode(bytes.slice(0, headerEnd));
+    const bodyBytes = bytes.slice(headerEnd + 4);
     const headers = parseHeaders(headerText);
     const [statusLine] = headerText.split('\r\n');
     const statusMatch = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})\s*(.*)$/);
@@ -742,8 +830,9 @@ function parseResponse(text) {
     if (!statusMatch)
         throw new Error(`Invalid NetBird JSON API status line: ${statusLine}`);
 
-    if (headers.get('transfer-encoding')?.toLowerCase().includes('chunked'))
-        body = decodeChunkedBody(body);
+    const body = headers.get('transfer-encoding')?.toLowerCase().includes('chunked')
+        ? decodeChunkedBody(bodyBytes)
+        : decoder.decode(bodyBytes);
 
     return {
         body,
@@ -783,24 +872,45 @@ function decodeChunkedBody(body) {
     const chunks = [];
 
     while (offset < body.length) {
-        const lineEnd = body.indexOf('\r\n', offset);
+        let lineEnd = -1;
+        for (let index = offset; index < body.length - 1; index++) {
+            if (body[index] === 13 && body[index + 1] === 10) {
+                lineEnd = index;
+                break;
+            }
+        }
         if (lineEnd === -1)
-            break;
+            throw new Error('Invalid chunked NetBird JSON API response');
 
-        const sizeText = body.slice(offset, lineEnd).split(';')[0].trim();
+        const sizeText = new TextDecoder()
+            .decode(body.slice(offset, lineEnd))
+            .split(';')[0]
+            .trim();
         const size = Number.parseInt(sizeText, 16);
         if (!Number.isFinite(size))
-            break;
+            throw new Error('Invalid NetBird JSON API chunk size');
 
         offset = lineEnd + 2;
         if (size === 0)
             break;
+        if (offset + size + 2 > body.length)
+            throw new Error('Truncated NetBird JSON API chunk');
 
         chunks.push(body.slice(offset, offset + size));
+        if (body[offset + size] !== 13 || body[offset + size + 1] !== 10)
+            throw new Error('Invalid NetBird JSON API chunk terminator');
         offset += size + 2;
     }
 
-    return chunks.join('');
+    const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+    const decoded = new Uint8Array(length);
+    let decodedOffset = 0;
+    for (const chunk of chunks) {
+        decoded.set(chunk, decodedOffset);
+        decodedOffset += chunk.length;
+    }
+
+    return new TextDecoder().decode(decoded);
 }
 
 function parseJsonBody(body) {
@@ -881,8 +991,8 @@ function readConfiguredJsonSocket() {
             const socket = params.json_socket || params.jsonSocket;
             if (typeof socket === 'string' && socket)
                 return socket;
-        } catch (error) {
-            console.warn(`Failed to read NetBird service params from ${path}: ${error}`);
+        } catch {
+            // An unreadable optional service file should not prevent socket discovery.
         }
     }
 

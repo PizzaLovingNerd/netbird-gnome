@@ -7,6 +7,10 @@ import {
     netbird_deregister,
     netbird_debug_bundle,
     netbird_down,
+    netbird_get_config,
+    netbird_network_deselect,
+    netbird_network_list,
+    netbird_network_select,
     netbird_profile_add,
     netbird_profile_list,
     netbird_profile_remove,
@@ -57,6 +61,22 @@ const tests = [
         netbird_daemon_update_result(withCancellable())],
     ['netbird_down', () => netbird_down({timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_down with cancellable', () => netbird_down(withCancellable())],
+    ['netbird_get_config', async () => {
+        const result = await netbird_get_config('Work Profile', {
+            timeoutMs: TEST_TIMEOUT_MS,
+        });
+        if (result.config.managementUrl !== 'https://api.netbird.io')
+            throw new Error('expected GetConfig response');
+    }],
+    ['netbird_network_list', async () => {
+        const result = await netbird_network_list({timeoutMs: TEST_TIMEOUT_MS});
+        if (result.networks[0]?.id !== 'office')
+            throw new Error('expected normalized network');
+    }],
+    ['netbird_network_select', () =>
+        netbird_network_select(['office'], {timeoutMs: TEST_TIMEOUT_MS})],
+    ['netbird_network_deselect', () =>
+        netbird_network_deselect([], {all: true, timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_status', () => netbird_status({timeoutMs: TEST_TIMEOUT_MS})],
     ['netbird_status with cancellable', () => netbird_status(withCancellable())],
     ['netbird_status connected daemon state', () =>
@@ -258,6 +278,35 @@ class FakeNetBirdJsonServer {
             };
         }
 
+        if (method === 'GetConfig') {
+            if (request.body.profileName !== 'Work Profile')
+                throw new Error(`unexpected profileName: ${request.body.profileName}`);
+            if (!request.body.username)
+                throw new Error('expected username');
+
+            return {
+                statusCode: 200,
+                body: {
+                    disableAutoConnect: false,
+                    managementUrl: 'https://api.netbird.io',
+                },
+            };
+        }
+
+        if (method === 'ListNetworks') {
+            return {
+                statusCode: 200,
+                body: {
+                    routes: [{
+                        ID: 'office',
+                        range: '10.0.0.0/24',
+                        resolvedIPs: {},
+                        selected: true,
+                    }],
+                },
+            };
+        }
+
         if (method === 'ListProfiles') {
             return {
                 statusCode: 200,
@@ -277,10 +326,12 @@ class FakeNetBirdJsonServer {
             'GetInstallerResult',
             'Logout',
             'RemoveProfile',
+            'SelectNetworks',
             'SetConfig',
             'SwitchProfile',
             'TriggerUpdate',
             'Up',
+            'DeselectNetworks',
         ].includes(method)) {
             if (method === 'SetConfig') {
                 if (request.body.profileName !== 'Work Profile')

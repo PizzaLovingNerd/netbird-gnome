@@ -3,24 +3,16 @@ import {
     netbird_daemon_update,
     netbird_debug_bundle,
     netbird_down,
+    netbird_get_config,
     netbird_profile_select,
     netbird_set_config,
     netbird_status,
     netbird_up,
 } from './api/index.js';
-import {
-    getActiveProfileName,
-    getServiceParamsPath,
-    MASKED_PRESHARED_KEY,
-    readBoolPtr,
-    readProfileConfig,
-    readServiceParams,
-    readUrlValue,
-    writeServiceParams,
-} from './profileConfig.js';
 
 
 export const GENERAL_PAGE_TITLE = 'General';
+const MASKED_PRESHARED_KEY = '**********';
 const NETBIRD_SETTINGS_TIMEOUT_MS = 30000;
 const NETBIRD_SETTINGS_QUERY_TIMEOUT_MS = 5000;
 
@@ -31,110 +23,77 @@ const ACTION_HANDLERS = {
 
 const NETBIRD_SETTINGS = {
     allowSsh: {
-        configKey: 'ServerSSHAllowed',
         apiKey: 'serverSSHAllowed',
-        boolPtr: true,
     },
     connectOnStartup: {
-        configKey: 'DisableAutoConnect',
         apiKey: 'disableAutoConnect',
         inverted: true,
     },
     quantumResistance: {
-        configKey: 'RosenpassEnabled',
         apiKey: 'rosenpassEnabled',
     },
     lazyConnections: {
-        configKey: 'LazyConnectionEnabled',
         apiKey: 'lazyConnectionEnabled',
     },
     blockInboundConnections: {
-        configKey: 'BlockInbound',
         apiKey: 'blockInbound',
     },
     notifications: {
-        configKey: 'DisableNotifications',
         apiKey: 'disableNotifications',
         inverted: true,
-        boolPtr: true,
     },
     managementUrl: {
-        configKey: 'ManagementURL',
         apiKey: 'managementUrl',
         type: 'url',
     },
     preSharedKey: {
-        configKey: 'PreSharedKey',
         apiKey: 'optionalPreSharedKey',
+        readApiKey: 'preSharedKey',
         type: 'preSharedKey',
     },
     connectionQuantumResistance: {
-        configKey: 'RosenpassPermissive',
         apiKey: 'rosenpassPermissive',
     },
     interfaceName: {
-        configKey: 'WgIface',
         apiKey: 'interfaceName',
     },
     interfacePort: {
-        configKey: 'WgPort',
         apiKey: 'wireguardPort',
     },
     mtu: {
-        configKey: 'MTU',
         apiKey: 'mtu',
     },
-    logFile: {
-        type: 'serviceLogFile',
-    },
     networkMonitor: {
-        configKey: 'NetworkMonitor',
         apiKey: 'networkMonitor',
-        boolPtr: true,
     },
     disableDns: {
-        configKey: 'DisableDNS',
         apiKey: 'disableDns',
     },
     disableClientRoutes: {
-        configKey: 'DisableClientRoutes',
         apiKey: 'disableClientRoutes',
     },
     disableServerRoutes: {
-        configKey: 'DisableServerRoutes',
         apiKey: 'disableServerRoutes',
     },
     disableLanAccess: {
-        configKey: 'BlockLANAccess',
         apiKey: 'blockLanAccess',
     },
     sshRootLogin: {
-        configKey: 'EnableSSHRoot',
         apiKey: 'enableSSHRoot',
-        boolPtr: true,
     },
     sshSftp: {
-        configKey: 'EnableSSHSFTP',
         apiKey: 'enableSSHSFTP',
-        boolPtr: true,
     },
     sshLocalPortForwarding: {
-        configKey: 'EnableSSHLocalPortForwarding',
         apiKey: 'enableSSHLocalPortForwarding',
-        boolPtr: true,
     },
     sshRemotePortForwarding: {
-        configKey: 'EnableSSHRemotePortForwarding',
         apiKey: 'enableSSHRemotePortForwarding',
-        boolPtr: true,
     },
     disableSshAuthentication: {
-        configKey: 'DisableSSHAuth',
         apiKey: 'disableSSHAuth',
-        boolPtr: true,
     },
     jwtCacheTtl: {
-        configKey: 'SSHJWTCacheTTL',
         apiKey: 'sshJWTCacheTTL',
         intPtr: true,
     },
@@ -199,22 +158,13 @@ export class SettingsManager {
         const setConfigRequest = {
             profileName,
         };
+        const appliedValues = new Map();
         let profileDirty = false;
-        let serviceParams = null;
-        let serviceDirty = false;
 
         for (const [key, value] of changes) {
             const handler = NETBIRD_SETTINGS[key];
             if (!handler)
                 continue;
-
-            if (handler.type === 'serviceLogFile') {
-                serviceParams ??= readServiceParams();
-                applyServiceLogFile(serviceParams, value);
-                serviceDirty = true;
-                this._values.set(key, value);
-                continue;
-            }
 
             const apiValue = toSetConfigValue(handler, value);
             if (apiValue === undefined)
@@ -222,17 +172,17 @@ export class SettingsManager {
 
             setConfigRequest[handler.apiKey] = apiValue;
             profileDirty = true;
-            this._values.set(key, value);
+            appliedValues.set(key, value);
         }
 
         if (profileDirty) {
             await netbird_set_config(setConfigRequest, {
                 timeoutMs: NETBIRD_SETTINGS_TIMEOUT_MS,
             });
+            appliedValues.forEach((value, key) => {
+                this._values.set(key, value);
+            });
         }
-
-        if (serviceDirty)
-            await writeServiceParams(serviceParams);
 
         const status = await netbird_status({
             timeoutMs: NETBIRD_SETTINGS_QUERY_TIMEOUT_MS,
@@ -273,30 +223,18 @@ export class SettingsManager {
         });
     }
 
-    async loadSettings(profileName = getActiveProfileName()) {
-        this._activeProfileName = profileName;
-
-        let profileConfig;
-        try {
-            profileConfig = readProfileConfig(profileName);
-        } catch (error) {
-            console.warn(`Failed to load NetBird profile config for ${profileName}: ${error}`);
-            return;
-        }
-
-        let serviceParams = {};
-        try {
-            serviceParams = readServiceParams();
-        } catch (error) {
-            console.warn(`Failed to load NetBird service params: ${error}`);
-        }
+    async loadSettings(profileName = this._activeProfileName) {
+        const requestedProfile = profileName || 'default';
+        const result = await netbird_get_config(requestedProfile, {
+            timeoutMs: NETBIRD_SETTINGS_QUERY_TIMEOUT_MS,
+        });
+        this._activeProfileName = requestedProfile;
 
         Object.entries(NETBIRD_SETTINGS).forEach(([key, handler]) => {
-            const value = readSettingValue(profileConfig, serviceParams, handler);
+            const value = readSettingValue(result.config, handler);
             if (value !== null)
                 this._values.set(key, value);
         });
-
         this._values.set('profile', this._activeProfileName);
     }
 
@@ -306,16 +244,6 @@ export class SettingsManager {
 
     supportsAction(key) {
         return key === 'profile' || Boolean(ACTION_HANDLERS[key]);
-    }
-
-    getPrivilegedSavePaths(changes) {
-        return changes
-            .filter(([key]) => NETBIRD_SETTINGS[key]?.type === 'serviceLogFile')
-            .map(() => getServiceParamsPath());
-    }
-
-    requiresPrivilegedSave(key) {
-        return NETBIRD_SETTINGS[key]?.type === 'serviceLogFile';
     }
 
     reset() {
@@ -358,11 +286,8 @@ export class SettingsManager {
     }
 }
 
-function readSettingValue(profileConfig, serviceParams, handler) {
-    if (handler.type === 'serviceLogFile')
-        return readServiceLogFile(serviceParams);
-
-    const rawValue = readProfileConfigValue(profileConfig, handler);
+function readSettingValue(config, handler) {
+    const rawValue = readConfigValue(config, handler);
     if (rawValue === null)
         return null;
 
@@ -372,30 +297,32 @@ function readSettingValue(profileConfig, serviceParams, handler) {
     return rawValue;
 }
 
-function readProfileConfigValue(config, handler) {
-    const {configKey, inverted = false, boolPtr = false, intPtr = false, type} = handler;
+function readConfigValue(config, handler) {
+    const {
+        apiKey,
+        inverted = false,
+        intPtr = false,
+        readApiKey = apiKey,
+        type,
+    } = handler;
 
     if (type === 'url')
-        return readUrlValue(config[configKey]) || null;
+        return typeof config[readApiKey] === 'string' ? config[readApiKey] : null;
 
     if (type === 'preSharedKey')
-        return config[configKey] ? String(config[configKey]) : '';
+        return config[readApiKey] ? String(config[readApiKey]) : '';
 
     if (intPtr) {
-        if (!Object.hasOwn(config, configKey) || config[configKey] === null)
+        if (!Object.hasOwn(config, readApiKey) || config[readApiKey] === null)
             return null;
 
-        return Number(config[configKey]);
+        return Number(config[readApiKey]);
     }
 
-    let value;
-    if (boolPtr)
-        value = readBoolPtr(config, configKey, false);
-    else if (Object.hasOwn(config, configKey))
-        value = Boolean(config[configKey]);
-    else
+    if (!Object.hasOwn(config, readApiKey))
         return null;
 
+    const value = Boolean(config[readApiKey]);
     return inverted ? !value : value;
 }
 
@@ -411,7 +338,7 @@ function toSetConfigValue(handler, value) {
 
     if (type === 'preSharedKey') {
         const nextValue = String(value ?? '').trim();
-        if (!nextValue || nextValue === MASKED_PRESHARED_KEY)
+        if (nextValue === MASKED_PRESHARED_KEY)
             return undefined;
 
         return nextValue;
@@ -427,22 +354,4 @@ function toSetConfigValue(handler, value) {
         return Number(storedValue);
 
     return Boolean(storedValue);
-}
-
-function readServiceLogFile(serviceParams) {
-    const logFiles = serviceParams.log_files;
-    if (!Array.isArray(logFiles) || logFiles.length === 0)
-        return '';
-
-    return String(logFiles[0] ?? '');
-}
-
-function applyServiceLogFile(serviceParams, value) {
-    const logFile = String(value ?? '').trim();
-    if (!logFile) {
-        delete serviceParams.log_files;
-        return;
-    }
-
-    serviceParams.log_files = [logFile];
 }

@@ -4,7 +4,7 @@
     {
       "name": "Open nested GNOME",
       "type": "node-terminal",
-      "command": "dbus-run-session -- gnome-shell --nested --wayland",
+      "command": "./test.bash",
       "request": "launch"
     }
   ]

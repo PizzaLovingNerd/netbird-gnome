@@ -4,9 +4,14 @@ import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk?version=4.0';
 
 import {
+    netbird_json_api_available,
     netbird_down,
+    netbird_network_deselect,
+    netbird_network_list,
+    netbird_network_select,
     netbird_profile_list,
     netbird_profile_select,
+    netbird_status,
     netbird_up,
 } from './api/index.js';
 import {
@@ -204,7 +209,10 @@ function addResourceControlsRow(page, state) {
         valign: Gtk.Align.CENTER,
     });
     selectAllButton.connect('clicked', () => {
-        runResourceAction(state, ['networks', 'select', 'all'], 'All resources selected');
+        runResourceAction(state, {
+            all: true,
+            select: true,
+        }, 'All resources selected');
     });
     row.add_suffix(selectAllButton);
 
@@ -214,7 +222,10 @@ function addResourceControlsRow(page, state) {
         valign: Gtk.Align.CENTER,
     });
     deselectAllButton.connect('clicked', () => {
-        runResourceAction(state, ['networks', 'deselect', 'all'], 'All resources deselected');
+        runResourceAction(state, {
+            all: true,
+            select: false,
+        }, 'All resources deselected');
     });
     row.add_suffix(deselectAllButton);
 
@@ -230,6 +241,12 @@ async function refreshProfiles(state) {
     switcher.busy = true;
     switcher.menu.sensitive = false;
     let activeProfile = '';
+
+    if (!netbird_json_api_available()) {
+        switcher.row.subtitle = 'NetBird JSON API unavailable';
+        switcher.busy = false;
+        return activeProfile;
+    }
 
     try {
         const result = await netbird_profile_list({
@@ -278,7 +295,6 @@ async function switchProfileFromMenu(state) {
             timeoutMs: NETBIRD_PROFILE_TIMEOUT_MS,
         });
         setActiveProfile(state, profileName);
-        await refreshProfiles(state);
         await refreshAfterAction(state);
         showToast(state.window, `Switched to ${profileName}`);
     } catch (error) {
@@ -329,70 +345,52 @@ async function refresh(state) {
 
     setBusy(state, true);
     renderLoading(state);
+    let homeError = '';
 
     try {
-        const statusResult = await settleCommand(['status', '--json']);
-        const networksResult = await settleCommand(['networks', 'list']);
-
-        if (statusResult.ok) {
-            try {
-                const status = parseStatus(statusResult.value.stdout);
-                state.connecting = isConnectingStatus(status.status);
-                state.connected = status.connected;
-                state.peers = status.peers;
-                if (status.profileName)
-                    setActiveProfile(state, status.profileName);
-                state.resources = status.resources;
-                await refreshProfiles(state);
-                renderPeers(state);
-            } catch (error) {
-                state.connecting = false;
-                state.connected = false;
-                state.peers = [];
-                state.profileName = '';
-                state.resources = [];
-                renderPeers(state, formatError(error));
-                showToast(state.window, `Failed to load peers: ${formatError(error)}`);
-            }
-        } else {
+        if (!netbird_json_api_available()) {
+            const message = 'This window requires the upcoming NetBird JSON API.';
+            homeError = message;
             state.connecting = false;
             state.connected = false;
             state.peers = [];
-            state.profileName = '';
             state.resources = [];
-            renderPeers(state, formatError(statusResult.error));
-            showToast(state.window, `Failed to load peers: ${formatError(statusResult.error)}`);
+            state.exitNodes = [];
+            renderHome(state, message);
+            renderPeers(state, message);
+            renderResources(state, message);
+            return;
         }
 
-        let resourceError = '';
-        if (networksResult.ok) {
-            try {
-                state.resources = mergeResources(
-                    state.resources,
-                    parseNetworksList(networksResult.value.stdout));
-            } catch (error) {
-                resourceError = formatError(error);
-                showToast(state.window, `Failed to parse resources: ${resourceError}`);
-            }
-        } else {
-            resourceError = formatError(networksResult.error);
-            showToast(state.window, `Failed to load resources: ${resourceError}`);
-        }
+        const [status, networks] = await Promise.all([
+            netbird_status({timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS}),
+            netbird_network_list({timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS}),
+        ]);
+
+        state.connecting = isConnectingStatus(status.status);
+        state.connected = status.connected;
+        state.peers = normalizePeers(status.details);
+        if (status.profileName)
+            setActiveProfile(state, status.profileName);
+        state.resources = networks.networks;
+        await refreshProfiles(state);
+        renderPeers(state);
 
         state.exitNodes = state.resources.filter(resource => resource.isExitNode);
         renderHome(state);
-        renderResources(state, resourceError);
+        renderResources(state);
     } catch (error) {
         console.warn(`Failed to render NetBird networks window: ${formatError(error)}`);
+        homeError = formatError(error);
         state.connecting = false;
         state.connected = false;
-        renderHome(state, formatError(error));
-        renderPeers(state, formatError(error));
-        renderResources(state, formatError(error));
-        showToast(state.window, `Failed to update networks: ${formatError(error)}`);
+        renderHome(state, homeError);
+        renderPeers(state, homeError);
+        renderResources(state, homeError);
+        showToast(state.window, `Failed to update networks: ${homeError}`);
     } finally {
         setBusy(state, false);
-        renderHome(state);
+        renderHome(state, homeError);
     }
 }
 
@@ -626,7 +624,7 @@ function createResourceRow(resource, state) {
     selectButton.connect('clicked', () => {
         runResourceAction(
             state,
-            ['networks', 'select', resource.id],
+            {networkIds: [resource.id], select: true},
             `Selected ${resource.id}`);
     });
     row.add_suffix(selectButton);
@@ -640,7 +638,7 @@ function createResourceRow(resource, state) {
     deselectButton.connect('clicked', () => {
         runResourceAction(
             state,
-            ['networks', 'deselect', resource.id],
+            {networkIds: [resource.id], select: false},
             `Deselected ${resource.id}`);
     });
     row.add_suffix(deselectButton);
@@ -662,13 +660,27 @@ function createStatusRow(title, subtitle, iconName = 'network-workgroup-symbolic
     return row;
 }
 
-async function runResourceAction(state, args, successMessage) {
+async function runResourceAction(state, {
+    all = false,
+    networkIds = [],
+    select,
+}, successMessage) {
     if (state.busy)
         return;
 
     setBusy(state, true);
     try {
-        await runNetBirdCommand(args);
+        if (select) {
+            await netbird_network_select(networkIds, {
+                all,
+                timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
+            });
+        } else {
+            await netbird_network_deselect(networkIds, {
+                all,
+                timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
+            });
+        }
         showToast(state.window, successMessage);
         await refreshAfterAction(state);
     } catch (error) {
@@ -715,17 +727,16 @@ async function runConnectionAction(state, connect) {
 }
 
 async function refreshAfterAction(state) {
-    const [statusOutput, networksOutput] = await Promise.all([
-        runNetBirdCommand(['status', '--json']),
-        runNetBirdCommand(['networks', 'list']),
+    const [status, networks] = await Promise.all([
+        netbird_status({timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS}),
+        netbird_network_list({timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS}),
     ]);
-    const status = parseStatus(statusOutput.stdout);
     state.connecting = isConnectingStatus(status.status);
     state.connected = status.connected;
-    state.peers = status.peers;
+    state.peers = normalizePeers(status.details);
     if (status.profileName)
         setActiveProfile(state, status.profileName);
-    state.resources = mergeResources(status.resources, parseNetworksList(networksOutput.stdout));
+    state.resources = networks.networks;
     state.exitNodes = state.resources.filter(resource => resource.isExitNode);
     await refreshProfiles(state);
     renderHome(state);
@@ -733,216 +744,16 @@ async function refreshAfterAction(state) {
     renderResources(state);
 }
 
-async function settleCommand(args) {
-    try {
-        return {
-            ok: true,
-            value: await runNetBirdCommand(args),
-        };
-    } catch (error) {
-        console.warn(`netbird ${args.join(' ')} failed: ${formatError(error)}`);
-        return {
-            error,
-            ok: false,
-        };
-    }
-}
-
-function runNetBirdCommand(args, timeoutMs = NETBIRD_COMMAND_TIMEOUT_MS) {
-    return new Promise((resolve, reject) => {
-        const netbird = GLib.find_program_in_path('netbird') ?? 'netbird';
-        let process;
-        try {
-            process = Gio.Subprocess.new(
-                [netbird, ...args],
-                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
-        } catch (error) {
-            reject(error);
-            return;
-        }
-
-        const cancellable = new Gio.Cancellable();
-        let settled = false;
-        const timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, timeoutMs, () => {
-            settled = true;
-            cancellable.cancel();
-            process.force_exit();
-            reject(new Error(`netbird ${args.join(' ')} timed out`));
-            return GLib.SOURCE_REMOVE;
-        });
-
-        process.communicate_utf8_async(null, cancellable, (_process, result) => {
-            if (settled)
-                return;
-
-            GLib.source_remove(timeoutId);
-            try {
-                const [, stdout, stderr] = process.communicate_utf8_finish(result);
-                const status = process.get_exit_status();
-                if (status !== 0) {
-                    reject(new Error((stderr || stdout || `netbird exited with status ${status}`).trim()));
-                    return;
-                }
-
-                resolve({
-                    stderr: stderr ?? '',
-                    stdout: stdout ?? '',
-                });
-            } catch (error) {
-                reject(error);
-            }
-        });
-    });
-}
-
-function parseStatus(output) {
-    let details = {};
-    try {
-        details = JSON.parse(output);
-    } catch (error) {
-        throw new Error(`NetBird returned invalid status JSON: ${formatError(error)}`);
-    }
-    const status = firstString(
-        details?.daemonStatus,
-        details?.status,
-        details?.connectionStatus,
-        details?.state);
-    const peerDetails = arrayValue(details?.peers?.details);
-    const peers = peerDetails.map(peer => ({
-        ip: firstString(peer?.netbirdIp, peer?.netbirdIP, peer?.IP),
-        name: firstString(peer?.fqdn, peer?.FQDN, peer?.name, peer?.hostname),
-        status: firstString(peer?.status, peer?.connStatus),
-    }));
-
-    return {
-        connected: isConnectedStatus(status),
-        peers,
-        profileName: firstString(details?.profileName),
-        resources: [
-            ...collectResources(details),
-            ...peerDetails.flatMap(peer => collectResources(peer, peer)),
-        ],
-        status,
-    };
-}
-
-function parseNetworksList(output) {
-    const text = stripAnsi(output).trim();
-    if (!text || /^No networks available\.?$/i.test(text))
+function normalizePeers(details) {
+    const peers = details?.fullStatus?.peers ?? details?.peers?.details ?? [];
+    if (!Array.isArray(peers))
         return [];
 
-    const parsed = parseNetworksJson(text);
-    if (parsed)
-        return parsed;
-
-    return text
-        .split('\n')
-        .map(line => parseNetworkLine(line))
-        .filter(Boolean);
-}
-
-function parseNetworksJson(text) {
-    try {
-        const data = JSON.parse(text);
-        const values = Array.isArray(data)
-            ? data
-            : data?.networks ?? data?.routes ?? data?.resources;
-        if (!Array.isArray(values))
-            return null;
-
-        return values.map(value => normalizeResource(value)).filter(resource => resource.id || resource.range);
-    } catch {
-        return null;
-    }
-}
-
-function parseNetworkLine(line) {
-    const raw = line.trim();
-    if (!raw || raw.includes('---') || /^ID\s+/i.test(raw) || /^Network\s+/i.test(raw))
-        return null;
-
-    const selected = /\bselected\b/i.test(raw) || /^\s*\[[xX*]\]/.test(raw);
-    const overlapping = /\boverlap/i.test(raw);
-    const cleaned = raw
-        .replace(/^\[[ xX*]\]\s*/, '')
-        .replace(/\bselected\b/ig, '')
-        .replace(/\boverlapp(?:ing|ed)?\b/ig, '')
-        .trim();
-    const columns = cleaned.split(/\s{2,}|\t+/).map(value => value.trim()).filter(Boolean);
-    const id = columns[0] ?? cleaned.split(/\s+/)[0] ?? '';
-    const range = columns.length >= 2 ? columns[1] : cleaned.split(/\s+/).slice(1).join(' ');
-
-    return normalizeResource({
-        id,
-        range,
-        resolvedIPs: columns.slice(2),
-        selected,
-        overlapping,
-    });
-}
-
-function collectResources(value, peer = null) {
-    const resources = [];
-    for (const key of ['networks', 'Networks', 'routes', 'Routes', 'resources', 'Resources']) {
-        for (const item of arrayValue(value?.[key]))
-            resources.push(normalizeResource(item, peer));
-    }
-    return resources;
-}
-
-function normalizeResource(value, peer = null) {
-    if (typeof value === 'string') {
-        return {
-            id: value,
-            isExitNode: isExitNodeRange(value),
-            overlapping: false,
-            range: value,
-            resolved: '',
-            selected: false,
-            sourcePeer: peer ? firstString(peer?.fqdn, peer?.name) : '',
-        };
-    }
-
-    const range = [
-        ...arrayOrSingle(value?.range),
-        ...arrayOrSingle(value?.Range),
-        ...arrayOrSingle(value?.ranges),
-        ...arrayOrSingle(value?.domains),
-        ...arrayOrSingle(value?.domain),
-    ].map(cleanString).filter(Boolean).join(', ');
-    const resolved = [
-        ...arrayOrSingle(value?.resolvedIPs),
-        ...arrayOrSingle(value?.resolvedIps),
-        ...arrayOrSingle(value?.resolved_ips),
-        ...arrayOrSingle(value?.ips),
-        ...arrayOrSingle(value?.IPs),
-    ].map(cleanString).filter(Boolean).join(', ');
-
-    return {
-        id: firstString(value?.id, value?.ID, value?.networkId, value?.routeId, value?.name, range),
-        isExitNode: isExitNodeRange(range),
-        overlapping: Boolean(value?.overlapping ?? value?.Overlapping ?? value?.overlaps),
-        range,
-        resolved,
-        selected: Boolean(value?.selected ?? value?.Selected),
-        sourcePeer: peer ? firstString(peer?.fqdn, peer?.name) : '',
-    };
-}
-
-function mergeResources(...groups) {
-    const seen = new Set();
-    const resources = [];
-    for (const group of groups) {
-        for (const resource of group) {
-            const key = `${resource.id}|${resource.range}|${resource.resolved}`;
-            if (seen.has(key))
-                continue;
-
-            seen.add(key);
-            resources.push(resource);
-        }
-    }
-    return resources.filter(resource => resource.id || resource.range);
+    return peers.map(peer => ({
+        ip: firstString(peer?.IP, peer?.ip, peer?.netbirdIp),
+        name: firstString(peer?.fqdn, peer?.name, peer?.hostname),
+        status: firstString(peer?.connStatus, peer?.status),
+    }));
 }
 
 function resourceSubtitle(resource) {
@@ -1002,33 +813,12 @@ function setBusy(state, busy) {
             state.profileSwitcher.names.length > 0;
 }
 
-function stripAnsi(value) {
-    return String(value ?? '').replace(/\u001b\[[0-9;]*m/g, '');
-}
-
 function isConnectedStatus(status) {
     return String(status ?? '').toLowerCase() === 'connected';
 }
 
 function isConnectingStatus(status) {
     return String(status ?? '').toLowerCase() === 'connecting';
-}
-
-function isExitNodeRange(value) {
-    return String(value ?? '')
-        .split(/[,\s]+/)
-        .some(part => part === '0.0.0.0/0' || part === '::/0');
-}
-
-function arrayValue(value) {
-    return Array.isArray(value) ? value : [];
-}
-
-function arrayOrSingle(value) {
-    if (Array.isArray(value))
-        return value;
-
-    return value === undefined || value === null ? [] : [value];
 }
 
 function firstString(...values) {

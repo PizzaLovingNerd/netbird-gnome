@@ -2,7 +2,7 @@
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 2 of the License, or
+ * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful,
@@ -35,17 +35,13 @@ import {
     netbird_up,
 } from './api/index.js';
 import {formatErrorMessage, isCancellation} from './extensionErrors.js';
-import {promptProfileName} from './profile-add-dialog.js';
 import {readProfileEmail} from './profileState.js';
+import {ProfileNameDialog} from './shellProfileDialog.js';
 
 const NETBIRD_COMMAND_TIMEOUT_MS = 30000;
 const NETBIRD_QUERY_TIMEOUT_MS = 5000;
 const NETBIRD_ERROR_NOTIFY_THROTTLE_US = 30000000;
 const NETBIRD_INITIAL_REFRESH_RETRY_MS = 3000;
-const NETBIRD_APPLICATION_ID = 'io.netbird.gnome';
-const NETBIRD_APPLICATION_NAME = 'NetBird for GNOME';
-const NETBIRD_VPN_TOGGLE_NAMES = /\b(netbird|wiretrustee|wt0)\b/i;
-
 const NETBIRD_STATUS_ICON_FILES = {
     connected: 'netbird-systemtray-connected-macos.svg',
     connecting: 'netbird-systemtray-connecting-macos.svg',
@@ -73,15 +69,6 @@ function disconnectSignal(object, signalId, context) {
     }
 }
 
-function readStringProperty(object, propertyName) {
-    try {
-        const value = object?.[propertyName];
-        return typeof value === 'string' ? value : '';
-    } catch {
-        return '';
-    }
-}
-
 const NetBirdToggle = GObject.registerClass(
 class NetBirdToggle extends QuickMenuToggle {
     constructor(extension, icons, indicator) {
@@ -101,6 +88,7 @@ class NetBirdToggle extends QuickMenuToggle {
         this._profileItems = [];
         this._profileStatusItem = null;
         this._addProfileMenuItem = null;
+        this._profileDialog = null;
         this._profileSectionIndex = 1;
         this._selectedProfileName = '';
         this._cancellable = new Gio.Cancellable();
@@ -272,11 +260,20 @@ class NetBirdToggle extends QuickMenuToggle {
     }
 
     _openAddProfileDialog() {
-        promptProfileName({
+        if (this._profileDialog)
+            return;
+
+        const dialog = new ProfileNameDialog({
             onAccept: profileName => this._runAsync(
                 this._addProfile(profileName),
                 'Failed to add NetBird profile'),
+            onClose: () => {
+                if (this._profileDialog === dialog)
+                    this._profileDialog = null;
+            },
         });
+        this._profileDialog = dialog;
+        dialog.open();
     }
 
     async _addProfile(profileName) {
@@ -300,7 +297,7 @@ class NetBirdToggle extends QuickMenuToggle {
         } catch (error) {
             if (!this._destroyed && !this._cancellable.is_cancelled()) {
                 this._setErrorState();
-                this._notifyCliError('Failed to add NetBird profile', error);
+                this._notifyError('Failed to add NetBird profile', error);
             }
         }
     }
@@ -383,7 +380,7 @@ class NetBirdToggle extends QuickMenuToggle {
         } catch (error) {
             if (!this._destroyed && !this._cancellable.is_cancelled()) {
                 this._setErrorState();
-                this._notifyCliError('Failed to load NetBird profiles', error);
+                this._notifyError('Failed to load NetBird profiles', error);
 
                 if (!preserveExisting && this._profileItems.length === 0)
                     this._showProfileStatus('Unable to load profiles');
@@ -422,7 +419,7 @@ class NetBirdToggle extends QuickMenuToggle {
         } catch (error) {
             if (!this._destroyed && !this._cancellable.is_cancelled()) {
                 this._setErrorState();
-                this._notifyCliError('Failed to select NetBird profile', error);
+                this._notifyError('Failed to select NetBird profile', error);
                 this._runAsync(
                     this._loadProfiles({preserveExisting: true}),
                     'Failed to load NetBird profiles');
@@ -461,9 +458,13 @@ class NetBirdToggle extends QuickMenuToggle {
         this._toggleOperation = operation;
         this._toggleCommandInProgress = true;
         this._setIconState(operation === 'connect' ? 'connecting' : 'disconnected');
+        return this._toggleCommandCancellable;
     }
 
-    _endToggleCommand() {
+    _endToggleCommand(cancellable = null) {
+        if (cancellable && this._toggleCommandCancellable !== cancellable)
+            return;
+
         this._toggleOperation = null;
         this._toggleCommandCancellable = null;
         this._toggleCancelRequested = false;
@@ -474,20 +475,20 @@ class NetBirdToggle extends QuickMenuToggle {
         if (this._destroyed)
             return;
 
-        this._beginToggleCommand(operation);
+        const commandCancellable = this._beginToggleCommand(operation);
         this.subtitle = operation === 'connect' ? 'Connecting...' : 'Disconnecting...';
 
         try {
             if (operation === 'connect') {
                 await netbird_up({
-                    cancellable: this._toggleCommandCancellable,
+                    cancellable: commandCancellable,
                     onLoginUrlOpen: () => this._notifyBrowserLogin(),
                     profileName: this._selectedProfileName,
                     timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
                 });
             } else {
                 await netbird_down({
-                    cancellable: this._toggleCommandCancellable,
+                    cancellable: commandCancellable,
                     timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
                 });
             }
@@ -499,16 +500,17 @@ class NetBirdToggle extends QuickMenuToggle {
                 this._clearErrorState();
         } catch (error) {
             if (this._toggleCancelRequested ||
-                isCancellation(error, this._toggleCommandCancellable))
+                isCancellation(error, commandCancellable))
                 return;
 
             if (!this._destroyed && !this._cancellable.is_cancelled()) {
                 this._setErrorState();
-                this._notifyCliError('Failed to change NetBird status', error);
+                this._notifyError('Failed to change NetBird status', error);
             }
         } finally {
-            if (!this._toggleCancelRequested) {
-                this._endToggleCommand();
+            if (this._toggleCommandCancellable === commandCancellable &&
+                !this._toggleCancelRequested) {
+                this._endToggleCommand(commandCancellable);
                 if (!this._destroyed)
                     this._runAsync(
                         this._refreshStatus(),
@@ -546,9 +548,9 @@ class NetBirdToggle extends QuickMenuToggle {
             if (!this._destroyed &&
                 !this._cancellable.is_cancelled() &&
                 !isCancellation(error, commandCancellable))
-                this._notifyCliError('Failed to cancel NetBird connection', error);
+                this._notifyError('Failed to cancel NetBird connection', error);
         } finally {
-            this._endToggleCommand();
+            this._endToggleCommand(commandCancellable);
             if (!this._destroyed) {
                 this._setCheckedFromStatus(false);
                 this._runAsync(
@@ -567,12 +569,12 @@ class NetBirdToggle extends QuickMenuToggle {
             return;
         }
 
-        this._beginToggleCommand('disconnect');
+        const commandCancellable = this._beginToggleCommand('disconnect');
         this.subtitle = 'Cancelling...';
 
         try {
             await netbird_down({
-                cancellable: this._cancellable,
+                cancellable: commandCancellable,
                 timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
             });
 
@@ -583,10 +585,10 @@ class NetBirdToggle extends QuickMenuToggle {
         } catch (error) {
             if (!this._destroyed && !this._cancellable.is_cancelled()) {
                 this._setErrorState();
-                this._notifyCliError('Failed to cancel NetBird connection', error);
+                this._notifyError('Failed to cancel NetBird connection', error);
             }
         } finally {
-            this._endToggleCommand();
+            this._endToggleCommand(commandCancellable);
             if (!this._destroyed) {
                 this._setCheckedFromStatus(false);
                 this._runAsync(
@@ -623,7 +625,7 @@ class NetBirdToggle extends QuickMenuToggle {
         } catch (error) {
             if (!this._destroyed && !this._cancellable.is_cancelled()) {
                 this._setErrorState();
-                this._notifyCliError('Failed to refresh NetBird status', error);
+                this._notifyError('Failed to refresh NetBird status', error);
             }
         } finally {
             this._statusRefreshInProgress = false;
@@ -732,18 +734,17 @@ class NetBirdToggle extends QuickMenuToggle {
         this.subtitle = this._selectedProfileName;
     }
 
-    _notifyCliError(context, error) {
+    _notifyError(context, error) {
         if (this._destroyed)
             return;
 
         const message = formatErrorMessage(error);
-        console.warn(`${context}: ${message}`);
-
         const nowUs = GLib.get_monotonic_time();
         if (nowUs - this._lastErrorNotificationUs < NETBIRD_ERROR_NOTIFY_THROTTLE_US)
             return;
 
         this._lastErrorNotificationUs = nowUs;
+        console.warn(`${context}: ${message}`);
         Main.notify('NetBird', `${context}: ${message}`);
     }
 
@@ -756,9 +757,9 @@ class NetBirdToggle extends QuickMenuToggle {
 
     _setJsonApiUnavailableState() {
         this._setErrorState('Service unavailable');
-        this._notifyCliError(
+        this._notifyError(
             'NetBird service unavailable',
-            new Error('The NetBird JSON socket is unavailable. Start NetBird with JSON API support enabled.'));
+            new Error('This NetBird installation does not provide the required JSON API socket.'));
     }
 
     _runAsync(promise, context) {
@@ -767,7 +768,7 @@ class NetBirdToggle extends QuickMenuToggle {
                 return;
 
             this._setErrorState();
-            this._notifyCliError(context, error);
+            this._notifyError(context, error);
         });
     }
 
@@ -781,6 +782,8 @@ class NetBirdToggle extends QuickMenuToggle {
         this._menuOpenSignalId = 0;
         this._toggleCommandCancellable?.cancel();
         this._cancellable.cancel();
+        this._profileDialog?.destroy();
+        this._profileDialog = null;
 
         super.destroy();
     }
@@ -815,30 +818,12 @@ class NetBirdIndicator extends SystemIndicator {
 });
 
 export default class NetBirdExtension extends Extension {
-    constructor(metadata) {
-        super(metadata);
-
-        this._indicator = null;
-        this._networksWindowProcess = null;
-        this._settingsWindowProcess = null;
-        this._vpnDownCancellable = null;
-        this._vpnDownInProgress = false;
-        this._vpnPatchToken = {};
-        this._vpnToggle = null;
-        this._vpnToggleCheckedSignalId = 0;
-        this._vpnWatchSourceId = 0;
-    }
-
     openProfileSettingsWindow() {
-        this._ensureDesktopFile();
-
         const settingsWindow = this.dir.get_child('settings-window.js').get_path();
         this._openTrackedWindow('_settingsWindowProcess', settingsWindow, 'settings');
     }
 
     openNetworksWindow() {
-        this._ensureDesktopFile();
-
         const networksWindow = this.dir.get_child('networks-window.js').get_path();
         this._openTrackedWindow('_networksWindowProcess', networksWindow, 'networks');
     }
@@ -854,16 +839,21 @@ export default class NetBirdExtension extends Extension {
             const launcher = new Gio.SubprocessLauncher({});
             launcher.setenv('NETBIRD_GNOME_EXTENSION_DIR', this.dir.get_path(), true);
             const process = launcher.spawnv([gjs, '-m', windowPath]);
+            const waitCancellable = new Gio.Cancellable();
             this[processProperty] = process;
+            this[`${processProperty}WaitCancellable`] = waitCancellable;
 
-            process.wait_async(null, (subprocess, result) => {
+            process.wait_async(waitCancellable, (subprocess, result) => {
                 try {
                     subprocess.wait_finish(result);
                 } catch (error) {
-                    console.warn(`Failed to watch NetBird ${label} window process: ${error}`);
+                    if (!isCancellation(error, waitCancellable))
+                        console.warn(`Failed to watch NetBird ${label} window process: ${error}`);
                 } finally {
                     if (this[processProperty] === subprocess)
                         this[processProperty] = null;
+                    if (this[`${processProperty}WaitCancellable`] === waitCancellable)
+                        this[`${processProperty}WaitCancellable`] = null;
                 }
             });
         } catch (error) {
@@ -875,7 +865,10 @@ export default class NetBirdExtension extends Extension {
         if (this._indicator)
             this.disable();
 
-        this._ensureDesktopFile();
+        this._networksWindowProcess = null;
+        this._networksWindowProcessWaitCancellable = null;
+        this._settingsWindowProcess = null;
+        this._settingsWindowProcessWaitCancellable = null;
 
         const icons = this._createIconSet();
         let indicator = null;
@@ -884,7 +877,6 @@ export default class NetBirdExtension extends Extension {
             indicator = new NetBirdIndicator(this, icons);
             Main.panel.statusArea.quickSettings.addExternalIndicator(indicator);
             this._indicator = indicator;
-            this._scheduleNativeVpnWatch();
         } catch (error) {
             indicator?.destroy();
             this._indicator = null;
@@ -908,54 +900,9 @@ export default class NetBirdExtension extends Extension {
         return icons;
     }
 
-    _ensureDesktopFile() {
-        const extensionDir = this.dir.get_path();
-        if (!extensionDir)
-            return;
-
-        const desktopDir = GLib.build_filenamev([
-            GLib.get_user_data_dir(),
-            'applications',
-        ]);
-        const desktopPath = GLib.build_filenamev([
-            desktopDir,
-            `${NETBIRD_APPLICATION_ID}.desktop`,
-        ]);
-        const gjs = GLib.find_program_in_path('gjs') ?? 'gjs';
-        const settingsWindow = GLib.build_filenamev([extensionDir, 'settings-window.js']);
-        const iconPath = GLib.build_filenamev([extensionDir, 'icons', 'netbird.svg']);
-        const contents = [
-            '[Desktop Entry]',
-            'Type=Application',
-            `Name=${NETBIRD_APPLICATION_NAME}`,
-            'Comment=NetBird Quick Setting for GNOME',
-            `Exec=${GLib.shell_quote(gjs)} -m ${GLib.shell_quote(settingsWindow)}`,
-            `Icon=${iconPath}`,
-            'NoDisplay=true',
-            'StartupNotify=false',
-            'Categories=Network;GNOME;GTK;',
-            '',
-        ].join('\n');
-
-        try {
-            GLib.mkdir_with_parents(desktopDir, 0o755);
-            GLib.file_set_contents(desktopPath, contents);
-        } catch (error) {
-            console.warn(`Failed to write NetBird desktop entry: ${error}`);
-        }
-    }
-
     disable() {
-        this._unwatchNativeVpnToggle();
-
-        if (this._vpnWatchSourceId) {
-            GLib.source_remove(this._vpnWatchSourceId);
-            this._vpnWatchSourceId = 0;
-        }
-
-        this._vpnDownCancellable?.cancel();
-        this._vpnDownCancellable = null;
-        this._vpnDownInProgress = false;
+        this._stopTrackedWindow('_networksWindowProcess');
+        this._stopTrackedWindow('_settingsWindowProcess');
 
         if (!this._indicator)
             return;
@@ -964,194 +911,10 @@ export default class NetBirdExtension extends Extension {
         this._indicator = null;
     }
 
-    _scheduleNativeVpnWatch() {
-        if (this._vpnWatchSourceId)
-            return;
-
-        this._vpnWatchSourceId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            this._vpnWatchSourceId = 0;
-
-            if (!this._indicator)
-                return GLib.SOURCE_REMOVE;
-
-            this._watchNativeVpnToggle();
-            return GLib.SOURCE_REMOVE;
-        });
-    }
-
-    _watchNativeVpnToggle() {
-        const vpnToggle = Main.panel.statusArea.quickSettings?._network?._vpnToggle ?? null;
-        if (this._vpnToggle === vpnToggle)
-            return;
-
-        this._unwatchNativeVpnToggle();
-
-        if (!vpnToggle)
-            return;
-
-        this._vpnToggle = vpnToggle;
-        this._patchNativeVpnToggle();
-        this._vpnToggleCheckedSignalId = vpnToggle.connect(
-            'notify::checked',
-            () => this._onNativeVpnCheckedChanged());
-    }
-
-    _unwatchNativeVpnToggle() {
-        if (!this._vpnToggle)
-            return;
-
-        this._unpatchNativeVpnToggle();
-        disconnectSignal(
-            this._vpnToggle,
-            this._vpnToggleCheckedSignalId,
-            'Failed to disconnect native VPN toggle signal');
-        this._vpnToggle = null;
-        this._vpnToggleCheckedSignalId = 0;
-    }
-
-    _patchNativeVpnToggle() {
-        if (!this._vpnToggle)
-            return;
-
-        if (this._vpnToggle._netBirdPatchOwner === this._vpnPatchToken)
-            return;
-
-        if (this._vpnToggle._netBirdPatchOwner)
-            this._restoreNativeVpnToggle(this._vpnToggle);
-
-        const vpnToggle = this._vpnToggle;
-        const originalActivate = vpnToggle.activate;
-        const originalGetActiveItems = vpnToggle._getActiveItems;
-        const originalGetPrimaryItem = vpnToggle._getPrimaryItem;
-
-        if (typeof originalActivate !== 'function' ||
-            typeof originalGetActiveItems !== 'function' ||
-            typeof originalGetPrimaryItem !== 'function')
-            return;
-
-        vpnToggle._netBirdOriginalActivate = originalActivate;
-        vpnToggle._netBirdOriginalGetActiveItems = originalGetActiveItems;
-        vpnToggle._netBirdOriginalGetPrimaryItem = originalGetPrimaryItem;
-        vpnToggle._netBirdPatchOwner = this._vpnPatchToken;
-
-        const extension = this;
-        vpnToggle.activate = function () {
-            if (!this.checked)
-                extension._disconnectNetBirdForNativeVpn();
-
-            originalActivate.call(this);
-        };
-
-        vpnToggle._getActiveItems = function* () {
-            for (const item of originalGetActiveItems.call(this)) {
-                if (!extension._vpnItemLooksLikeNetBird(item))
-                    yield item;
-            }
-        };
-
-        vpnToggle._getPrimaryItem = function () {
-            const [activeItem] = this._getActiveItems();
-            if (activeItem)
-                return activeItem;
-
-            const itemSorter = this._itemSorter;
-            if (itemSorter?.itemsByMru) {
-                for (const item of itemSorter.itemsByMru()) {
-                    if (!extension._vpnItemLooksLikeNetBird(item) &&
-                        item.timestamp > 0)
-                        return item;
-                }
-            }
-
-            if (itemSorter?.[Symbol.iterator]) {
-                for (const item of itemSorter) {
-                    if (!extension._vpnItemLooksLikeNetBird(item) &&
-                        item.visible)
-                        return item;
-                }
-            }
-
-            return null;
-        };
-
-        this._syncNativeVpnToggle();
-    }
-
-    _unpatchNativeVpnToggle() {
-        if (!this._vpnToggle ||
-            this._vpnToggle._netBirdPatchOwner !== this._vpnPatchToken)
-            return;
-
-        this._restoreNativeVpnToggle(this._vpnToggle);
-        this._syncNativeVpnToggle();
-    }
-
-    _restoreNativeVpnToggle(vpnToggle) {
-        if (vpnToggle._netBirdOriginalActivate)
-            vpnToggle.activate = vpnToggle._netBirdOriginalActivate;
-        if (vpnToggle._netBirdOriginalGetActiveItems)
-            vpnToggle._getActiveItems = vpnToggle._netBirdOriginalGetActiveItems;
-        if (vpnToggle._netBirdOriginalGetPrimaryItem)
-            vpnToggle._getPrimaryItem = vpnToggle._netBirdOriginalGetPrimaryItem;
-
-        delete vpnToggle._netBirdOriginalActivate;
-        delete vpnToggle._netBirdOriginalGetActiveItems;
-        delete vpnToggle._netBirdOriginalGetPrimaryItem;
-        delete vpnToggle._netBirdPatchOwner;
-    }
-
-    _syncNativeVpnToggle() {
-        try {
-            this._vpnToggle?._sync?.();
-        } catch (error) {
-            console.warn(`Failed to sync native VPN toggle: ${error}`);
-        }
-    }
-
-    _vpnItemLooksLikeNetBird(item) {
-        const labels = [
-            readStringProperty(item, 'name'),
-            readStringProperty(item, 'title'),
-            item?.label?.text,
-            item?._label?.text,
-            item?._connection?.get_id?.(),
-            item?._activeConnection?.connection?.get_id?.(),
-        ];
-
-        return labels.some(label =>
-            typeof label === 'string' && NETBIRD_VPN_TOGGLE_NAMES.test(label));
-    }
-
-    _onNativeVpnCheckedChanged() {
-        if (!this._indicator || !this._vpnToggle?.checked)
-            return;
-
-        this._disconnectNetBirdForNativeVpn().catch(error => {
-            console.warn(`Failed to disconnect NetBird for native VPN: ${formatErrorMessage(error)}`);
-        });
-    }
-
-    async _disconnectNetBirdForNativeVpn() {
-        if (this._vpnDownInProgress || !netbird_json_api_available())
-            return;
-
-        this._vpnDownInProgress = true;
-        this._vpnDownCancellable?.cancel();
-        this._vpnDownCancellable = new Gio.Cancellable();
-        const cancellable = this._vpnDownCancellable;
-
-        try {
-            await netbird_down({
-                cancellable,
-                timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
-            });
-        } catch (error) {
-            if (!cancellable.is_cancelled())
-                console.warn(`Failed to disconnect NetBird for native VPN: ${error}`);
-        } finally {
-            if (this._vpnDownCancellable === cancellable)
-                this._vpnDownCancellable = null;
-            this._vpnDownInProgress = false;
-        }
+    _stopTrackedWindow(processProperty) {
+        const cancellableProperty = `${processProperty}WaitCancellable`;
+        this[cancellableProperty]?.cancel();
+        this[cancellableProperty] = null;
+        this[processProperty] = null;
     }
 }

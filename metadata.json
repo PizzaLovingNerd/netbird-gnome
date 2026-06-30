@@ -2,5 +2,6 @@
   "name": "NetBird for GNOME",
   "description": "NetBird Quick Setting for GNOME",
   "uuid": "gnome@netbird.io",
-  "shell-version": ["47", "48", "49", "50"]
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "url": "https://github.com/PizzaLovingNerd/netbird-gnome"
 }
