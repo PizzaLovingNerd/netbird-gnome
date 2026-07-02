@@ -10,6 +10,7 @@ import {
     netbird_profile_select,
 } from './api/index.js';
 import {confirmProfileDeregister, promptProfileName} from './gtkProfileDialogs.js';
+import {_} from './i18n.js';
 import {GENERAL_PAGE_TITLE, SettingsManager} from './settingsManager.js';
 import {setNetBirdWindowIcon} from './windowIcon.js';
 
@@ -20,7 +21,7 @@ const NETBIRD_PROFILE_TIMEOUT_MS = 30000;
 export function createSettingsWindow(application) {
     const window = new Adw.ApplicationWindow({
         application,
-        title: 'NetBird Settings',
+        title: _('NetBird Settings'),
         default_width: 860,
         default_height: 600,
     });
@@ -85,7 +86,7 @@ export function createSettingsWindow(application) {
 async function initializeSettings(settings, controller, profileSwitcher, toastOverlay) {
     if (!netbird_json_api_available()) {
         setRowsSensitive(settings, controller.rowsByKey, false);
-        showToast(toastOverlay, 'NetBird JSON API is unavailable');
+        showToast(toastOverlay, _('NetBird JSON API is unavailable'));
         return;
     }
 
@@ -95,7 +96,7 @@ async function initializeSettings(settings, controller, profileSwitcher, toastOv
     } catch (error) {
         console.warn(`Failed to initialize NetBird settings: ${error}`);
         setRowsSensitive(settings, controller.rowsByKey, false);
-        showToast(toastOverlay, 'NetBird JSON API is unavailable');
+        showToast(toastOverlay, _('NetBird JSON API is unavailable'));
     }
 }
 
@@ -130,12 +131,12 @@ function createApplyController(window, settings, toastOverlay) {
             try {
                 await settings.applyChanges(changes);
                 pendingValues.clear();
-                showToast(toastOverlay, 'Settings saved');
+                showToast(toastOverlay, _('Settings saved'));
             } catch (error) {
                 console.warn(`Failed to apply NetBird settings: ${error}`);
                 const message = String(error).includes('cancelled')
-                    ? 'Settings save was cancelled'
-                    : 'Failed to apply NetBird settings';
+                    ? _('Settings save was cancelled')
+                    : _('Failed to apply NetBird settings');
                 showToast(toastOverlay, message);
             } finally {
                 setRowsSensitive(settings, rowsByKey, true);
@@ -213,7 +214,7 @@ function createProfileSwitcher(settings, controller, toastOverlay) {
             switcher.setSelected(settings.activeProfileName);
         } catch (error) {
             console.warn(`Failed to switch NetBird profile: ${error}`);
-            showToast(toastOverlay, 'Failed to switch NetBird profile');
+            showToast(toastOverlay, _('Failed to switch NetBird profile'));
             switcher.setSelected(settings.activeProfileName);
         } finally {
             profileMenu.sensitive = true;
@@ -232,7 +233,7 @@ function createHeaderBar(controller, title, profileSwitcher) {
     });
 
     const cancelButton = new Gtk.Button({
-        label: 'Cancel',
+        label: _('Cancel'),
     });
     cancelButton.connect('clicked', () => controller.cancel());
     headerBar.pack_start(cancelButton);
@@ -240,7 +241,7 @@ function createHeaderBar(controller, title, profileSwitcher) {
     headerBar.pack_start(profileSwitcher.widget);
 
     const applyButton = new Gtk.Button({
-        label: 'Apply',
+        label: _('Apply'),
         css_classes: ['suggested-action'],
         sensitive: false,
     });
@@ -270,11 +271,11 @@ function createWindowContent(headerBar, content) {
 function createSettingsLayout(stack, pages) {
     return new Adw.NavigationSplitView({
         sidebar: new Adw.NavigationPage({
-            title: 'Sidebar',
+            title: _('Sidebar'),
             child: createSidebar(stack, pages),
         }),
         content: new Adw.NavigationPage({
-            title: 'Settings',
+            title: _('Settings'),
             child: stack,
         }),
         sidebar_width_fraction: 0.2,
@@ -396,16 +397,17 @@ function createProfilesPage(pageDefinition, settings, controller, toastOverlay, 
     });
 
     const profilesGroup = new Adw.PreferencesGroup({
-        title: 'Profiles',
+        title: _('Profiles'),
     });
     page.add(profilesGroup);
 
     const addRow = new Adw.ActionRow({
-        title: 'Add Profile',
-        subtitle: 'Create a new NetBird profile',
+        title: _('Add Profile'),
+        subtitle: _('Create a new NetBird profile'),
+        use_markup: false,
     });
     const addButton = new Gtk.Button({
-        label: 'Add',
+        label: _('Add'),
         css_classes: ['suggested-action'],
         valign: Gtk.Align.CENTER,
     });
@@ -433,15 +435,15 @@ function createProfilesPage(pageDefinition, settings, controller, toastOverlay, 
             addButton.sensitive = false;
             setProfileRows([
                 createStatusRow(
-                    'NetBird JSON API Unavailable',
-                    'Profile management requires the upcoming NetBird JSON API.'),
+                    _('NetBird JSON API Unavailable'),
+                    _('Profile management requires the upcoming NetBird JSON API.')),
             ]);
             return;
         }
 
         if (profileRows.length === 0) {
             setProfileRows([
-                createStatusRow('Loading Profiles', 'Reading NetBird profiles...'),
+                createStatusRow(_('Loading Profiles'), _('Reading NetBird profiles...')),
             ]);
         }
 
@@ -453,10 +455,10 @@ function createProfilesPage(pageDefinition, settings, controller, toastOverlay, 
         } catch (error) {
             console.warn(`Failed to load NetBird profiles: ${error}`);
             setProfileRows([
-                createStatusRow('Failed to Load Profiles', String(error)),
+                createStatusRow(_('Failed to Load Profiles'), String(error)),
                 createRefreshProfilesRow(refreshProfiles),
             ]);
-            showToast(toastOverlay, 'Failed to load NetBird profiles');
+            showToast(toastOverlay, _('Failed to load NetBird profiles'));
         }
     };
 
@@ -489,7 +491,7 @@ function createProfilesPage(pageDefinition, settings, controller, toastOverlay, 
     const renderProfileRows = profiles => {
         const rows = [createRefreshProfilesRow(refreshProfiles)];
         if (profiles.length === 0) {
-            rows.push(createStatusRow('No Profiles', 'Add a profile to get started.'));
+            rows.push(createStatusRow(_('No Profiles'), _('Add a profile to get started.')));
         } else {
             profiles.forEach(profile => {
                 rows.push(createProfileRow(profile, {
@@ -500,14 +502,14 @@ function createProfilesPage(pageDefinition, settings, controller, toastOverlay, 
                             () => netbird_deregister(profileName, {
                                 timeoutMs: NETBIRD_PROFILE_TIMEOUT_MS,
                             }),
-                            `Failed to deregister profile ${profileName}`,
+                            _('Failed to deregister profile %s').replace('%s', profileName),
                             onProfilesChanged),
                     }),
                     onRemove: profileName => runProfileAction(
                         () => netbird_profile_remove(profileName, {
                             timeoutMs: NETBIRD_PROFILE_TIMEOUT_MS,
                         }),
-                        `Failed to remove profile ${profileName}`,
+                        _('Failed to remove profile %s').replace('%s', profileName),
                         onProfilesChanged),
                 }));
             });
@@ -523,7 +525,7 @@ function createProfilesPage(pageDefinition, settings, controller, toastOverlay, 
                 () => netbird_profile_add(profileName, {
                     timeoutMs: NETBIRD_PROFILE_TIMEOUT_MS,
                 }),
-                `Failed to add profile ${profileName}`,
+                _('Failed to add profile %s').replace('%s', profileName),
                 onProfilesChanged),
         });
     });
@@ -536,13 +538,15 @@ function createProfilesPage(pageDefinition, settings, controller, toastOverlay, 
 
 function createRefreshProfilesRow(onRefresh) {
     const row = new Adw.ActionRow({
-        title: 'Refresh Profiles',
-        subtitle: 'Reload the current NetBird profile list',
+        title: _('Refresh Profiles'),
+        subtitle: _('Reload the current NetBird profile list'),
+        use_markup: false,
     });
     const button = new Gtk.Button({
         icon_name: 'view-refresh-symbolic',
         valign: Gtk.Align.CENTER,
     });
+    setAccessibleLabel(button, _('Refresh Profiles'));
     button.connect('clicked', () => {
         onRefresh();
     });
@@ -558,7 +562,8 @@ function createProfileRow(profile, {
 }) {
     const row = new Adw.ActionRow({
         title: profile.name,
-        subtitle: profile.selected ? 'Active profile' : '',
+        subtitle: profile.selected ? _('Active profile') : '',
+        use_markup: false,
     });
 
     row.add_prefix(new Gtk.Image({
@@ -567,7 +572,7 @@ function createProfileRow(profile, {
     }));
 
     const deregisterButton = new Gtk.Button({
-        label: 'Deregister',
+        label: _('Deregister'),
         valign: Gtk.Align.CENTER,
     });
     deregisterButton.connect('clicked', () => {
@@ -576,13 +581,13 @@ function createProfileRow(profile, {
     row.add_suffix(deregisterButton);
 
     const removeButton = new Gtk.Button({
-        label: 'Remove',
+        label: _('Remove'),
         css_classes: ['destructive-action'],
         valign: Gtk.Align.CENTER,
         sensitive: !profile.selected,
         tooltip_text: profile.selected
-            ? 'Switch to another profile before removing'
-            : 'Delete this profile',
+            ? _('Switch to another profile before removing')
+            : _('Delete this profile'),
     });
     removeButton.connect('clicked', () => {
         onRemove(profile.name);
@@ -597,6 +602,7 @@ function createStatusRow(title, subtitle = '') {
         title,
         subtitle,
         activatable: false,
+        use_markup: false,
     });
 }
 
@@ -612,18 +618,21 @@ function createRow(rowDefinition, settings) {
             title: rowDefinition.title,
             subtitle: rowDefinition.subtitle ?? '',
             active: Boolean(value),
+            use_markup: false,
         });
         break;
     case 'entry':
         row = new Adw.EntryRow({
             title: rowDefinition.title,
             text: value ?? '',
+            use_markup: false,
         });
         break;
     case 'password':
         row = new Adw.PasswordEntryRow({
             title: rowDefinition.title,
             text: value ?? '',
+            use_markup: false,
         });
         break;
     case 'spin':
@@ -639,12 +648,14 @@ function createRow(rowDefinition, settings) {
             }),
             climb_rate: 1,
             digits: 0,
+            use_markup: false,
         });
         break;
     case 'action':
         row = new Adw.ActionRow({
             title: rowDefinition.title,
             subtitle: rowDefinition.subtitle ?? '',
+            use_markup: false,
         });
         break;
     default:
@@ -714,7 +725,9 @@ async function activateSetting(rowDefinition, row, settings, toastOverlay = null
         console.warn(`Failed to activate ${rowDefinition.key}: ${error}`);
         if (row.subtitle !== undefined)
             row.subtitle = previousSubtitle;
-        showToast(toastOverlay, `Failed to ${rowDefinition.title.toLowerCase()}`);
+        showToast(
+            toastOverlay,
+            _('Failed to activate %s').replace('%s', rowDefinition.title));
     } finally {
         row.sensitive = settings.supportsAction(rowDefinition.key);
     }
@@ -722,10 +735,10 @@ async function activateSetting(rowDefinition, row, settings, toastOverlay = null
 
 function formatActionResult(rowDefinition, result) {
     if (rowDefinition.key === 'updateDaemon')
-        return result?.message || 'Daemon update request completed';
+        return result?.message || _('Daemon update request completed');
 
     if (rowDefinition.key === 'createDebugBundle')
-        return 'Debug bundle created';
+        return _('Debug bundle created');
 
     return result?.message ?? '';
 }
@@ -741,7 +754,7 @@ function reloadSettingsValues(settings, controller) {
         const value = settings.getValue(key);
 
         if (key === 'profile' && row.subtitle !== undefined)
-            row.subtitle = settings.activeProfileName || 'Open profile management';
+            row.subtitle = settings.activeProfileName || _('Open profile management');
 
         setRowValue(row, definition, value);
     });
@@ -783,5 +796,9 @@ function showToast(window, title) {
     if (typeof window.add_toast !== 'function')
         return;
 
-    window.add_toast(new Adw.Toast({title}));
+    window.add_toast(new Adw.Toast({title, use_markup: false}));
+}
+
+function setAccessibleLabel(widget, label) {
+    widget.update_property([Gtk.AccessibleProperty.LABEL], [label]);
 }

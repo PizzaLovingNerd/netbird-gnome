@@ -14,6 +14,7 @@ import {
     netbird_status,
     netbird_up,
 } from './api/index.js';
+import {_, ngettext} from './i18n.js';
 import {
     configureNetBirdApplicationIdentity,
     NETBIRD_APPLICATION_ID,
@@ -31,7 +32,7 @@ configureNetBirdApplicationIdentity();
 function createNetworksWindow(application) {
     const window = new Adw.PreferencesWindow({
         application,
-        title: 'Networks',
+        title: _('Networks'),
         default_width: 760,
         default_height: 560,
         search_enabled: false,
@@ -54,17 +55,17 @@ function createNetworksWindow(application) {
 function createNetworksUi(window) {
     const homePage = createHomePage();
     const peersPage = createListPage({
-        emptySubtitle: 'No peers were reported by NetBird.',
-        emptyTitle: 'No Peers Available',
+        emptySubtitle: _('No peers were reported by NetBird.'),
+        emptyTitle: _('No Peers Available'),
         iconName: 'computer-symbolic',
-        title: 'Peers',
+        title: _('Peers'),
     });
     const resourcesPage = createListPage(
         {
-            emptySubtitle: 'No routed networks or resources have been shared with this peer.',
-            emptyTitle: 'No Resources Available',
+            emptySubtitle: _('No routed networks or resources have been shared with this peer.'),
+            emptyTitle: _('No Resources Available'),
             iconName: 'network-workgroup-symbolic',
-            title: 'Resources',
+            title: _('Resources'),
         });
 
     const state = {
@@ -100,7 +101,7 @@ function createHomePage() {
     const page = new Adw.PreferencesPage({
         hexpand: true,
         icon_name: 'go-home-symbolic',
-        title: 'Home',
+        title: _('Home'),
         vexpand: true,
     });
     const statusGroup = new Adw.PreferencesGroup();
@@ -147,15 +148,17 @@ function createListPage({
 
 function addRefreshRow(page, state) {
     const row = new Adw.ActionRow({
-        title: 'Refresh',
-        subtitle: 'Reload peers and resources from NetBird',
+        title: _('Refresh'),
+        subtitle: _('Reload peers and resources from NetBird'),
+        use_markup: false,
         activatable: false,
     });
     const button = new Gtk.Button({
         icon_name: 'view-refresh-symbolic',
-        tooltip_text: 'Refresh',
+        tooltip_text: _('Refresh'),
         valign: Gtk.Align.CENTER,
     });
+    setAccessibleLabel(button, _('Refresh'));
     button.connect('clicked', () => {
         refresh(state);
     });
@@ -167,8 +170,9 @@ function addRefreshRow(page, state) {
 
 function addProfileSwitcherRow(page, state) {
     const row = new Adw.ActionRow({
-        title: 'Profile',
-        subtitle: 'Active NetBird profile',
+        title: _('Profile'),
+        subtitle: _('Active NetBird profile'),
+        use_markup: false,
         activatable: false,
     });
     const profileMenu = new Gtk.DropDown({
@@ -199,12 +203,13 @@ function addResourceControlsRow(page, state) {
     addRefreshRow(page, state);
 
     const row = new Adw.ActionRow({
-        title: 'Resource Selection',
-        subtitle: 'Accept all routed resources or disable them for this peer',
+        title: _('Resource Selection'),
+        subtitle: _('Accept all routed resources or disable them for this peer'),
+        use_markup: false,
         activatable: false,
     });
     const selectAllButton = new Gtk.Button({
-        label: 'Select All',
+        label: _('Select All'),
         sensitive: state.connected,
         valign: Gtk.Align.CENTER,
     });
@@ -212,12 +217,12 @@ function addResourceControlsRow(page, state) {
         runResourceAction(state, {
             all: true,
             select: true,
-        }, 'All resources selected');
+        }, _('All resources selected'));
     });
     row.add_suffix(selectAllButton);
 
     const deselectAllButton = new Gtk.Button({
-        label: 'Deselect All',
+        label: _('Deselect All'),
         sensitive: state.connected,
         valign: Gtk.Align.CENTER,
     });
@@ -225,7 +230,7 @@ function addResourceControlsRow(page, state) {
         runResourceAction(state, {
             all: true,
             select: false,
-        }, 'All resources deselected');
+        }, _('All resources deselected'));
     });
     row.add_suffix(deselectAllButton);
 
@@ -243,7 +248,7 @@ async function refreshProfiles(state) {
     let activeProfile = '';
 
     if (!netbird_json_api_available()) {
-        switcher.row.subtitle = 'NetBird JSON API unavailable';
+        switcher.row.subtitle = _('NetBird JSON API unavailable');
         switcher.busy = false;
         return activeProfile;
     }
@@ -267,7 +272,7 @@ async function refreshProfiles(state) {
         selectProfileInMenu(state, activeProfile);
     } catch (error) {
         console.warn(`Failed to load NetBird profiles: ${formatError(error)}`);
-        switcher.row.subtitle = 'Profiles could not be loaded';
+        switcher.row.subtitle = _('Profiles could not be loaded');
     } finally {
         switcher.suppressChange = false;
         switcher.busy = false;
@@ -296,10 +301,12 @@ async function switchProfileFromMenu(state) {
         });
         setActiveProfile(state, profileName);
         await refreshAfterAction(state);
-        showToast(state.window, `Switched to ${profileName}`);
+        showToast(state.window, _('Switched to %s').replace('%s', profileName));
     } catch (error) {
         console.warn(`Failed to switch NetBird profile: ${formatError(error)}`);
-        showToast(state.window, `Failed to switch profile: ${formatError(error)}`);
+        showToast(
+            state.window,
+            _('Failed to switch profile: %s').replace('%s', formatError(error)));
         selectProfileInMenu(state, state.profileName);
     } finally {
         setBusy(state, false);
@@ -349,7 +356,7 @@ async function refresh(state) {
 
     try {
         if (!netbird_json_api_available()) {
-            const message = 'This window requires the upcoming NetBird JSON API.';
+            const message = _('This window requires the upcoming NetBird JSON API.');
             homeError = message;
             state.connecting = false;
             state.connected = false;
@@ -387,7 +394,9 @@ async function refresh(state) {
         renderHome(state, homeError);
         renderPeers(state, homeError);
         renderResources(state, homeError);
-        showToast(state.window, `Failed to update networks: ${homeError}`);
+        showToast(
+            state.window,
+            _('Failed to update networks: %s').replace('%s', homeError));
     } finally {
         setBusy(state, false);
         renderHome(state, homeError);
@@ -408,8 +417,8 @@ function renderLoading(state) {
         state,
     }));
     addDetailRow(state.homePage, createExitNodesRow(state.exitNodes, state.connected));
-    addRow(state.peersPage, createStatusRow('Loading Peers', 'Reading NetBird peer status...'));
-    addRow(state.resourcesPage, createStatusRow('Loading Resources', 'Reading NetBird routed resources...'));
+    addRow(state.peersPage, createStatusRow(_('Loading Peers'), _('Reading NetBird peer status...')));
+    addRow(state.resourcesPage, createStatusRow(_('Loading Resources'), _('Reading NetBird routed resources...')));
 }
 
 function renderHome(state, errorMessage = '') {
@@ -432,7 +441,7 @@ function renderPeers(state, errorMessage = '') {
 
     if (state.peers.length === 0) {
         addRow(state.peersPage, createStatusRow(
-            errorMessage ? 'Peers Could Not Be Loaded' : state.peersPage.emptyTitle,
+            errorMessage ? _('Peers Could Not Be Loaded') : state.peersPage.emptyTitle,
             errorMessage || state.peersPage.emptySubtitle,
             errorMessage ? 'dialog-warning-symbolic' : 'computer-symbolic',
             state.connected));
@@ -441,7 +450,7 @@ function renderPeers(state, errorMessage = '') {
 
     if (errorMessage) {
         addRow(state.peersPage, createStatusRow(
-            'Peer Status Warning',
+            _('Peer Status Warning'),
             errorMessage,
             'dialog-warning-symbolic'));
     }
@@ -456,7 +465,7 @@ function renderResources(state, errorMessage = '') {
 
     if (state.resources.length === 0) {
         addRow(state.resourcesPage, createStatusRow(
-            errorMessage ? 'Resources Could Not Be Loaded' : state.resourcesPage.emptyTitle,
+            errorMessage ? _('Resources Could Not Be Loaded') : state.resourcesPage.emptyTitle,
             errorMessage || state.resourcesPage.emptySubtitle,
             errorMessage ? 'dialog-warning-symbolic' : 'network-workgroup-symbolic',
             state.connected));
@@ -465,7 +474,7 @@ function renderResources(state, errorMessage = '') {
 
     if (errorMessage) {
         addRow(state.resourcesPage, createStatusRow(
-            'Resource Status Warning',
+            _('Resource Status Warning'),
             errorMessage,
             'dialog-warning-symbolic'));
     }
@@ -484,14 +493,14 @@ function createHomeStatusRow({
     state,
 }) {
     const statusTitle = loading
-        ? 'Loading'
-        : connecting ? 'Connecting...' : connected ? 'Connected' : 'Disconnected';
+        ? _('Loading')
+        : connecting ? _('Connecting...') : connected ? _('Connected') : _('Disconnected');
     const statusSubtitle = errorMessage ||
         (connecting
-            ? 'Connecting to NetBird...'
+            ? _('Connecting to NetBird...')
             : connected
-            ? profileName || 'NetBird is connected'
-            : 'Connect to NetBird to see networks and resources');
+            ? profileName || _('NetBird is connected')
+            : _('Connect to NetBird to see networks and resources'));
     const statusBox = new Gtk.Box({
         orientation: Gtk.Orientation.VERTICAL,
         spacing: 12,
@@ -511,6 +520,7 @@ function createHomeStatusRow({
         sensitive: Boolean(state) && !state.busy && !loading,
         halign: Gtk.Align.CENTER,
     });
+    setAccessibleLabel(statusSwitch, _('Connect NetBird'));
     statusSwitch.connect('notify::active', () => {
         if (!state)
             return;
@@ -536,11 +546,13 @@ function createHomeStatusRow({
 
 function createExitNodesRow(exitNodes, connected) {
     const row = new Adw.ExpanderRow({
-        title: 'Exit Nodes',
+        title: _('Exit Nodes'),
         subtitle: exitNodes.length > 0
-            ? `${exitNodes.length} available`
-            : 'No exit nodes available',
+            ? ngettext('%d available', '%d available', exitNodes.length)
+                .replace('%d', String(exitNodes.length))
+            : _('No exit nodes available'),
         sensitive: connected,
+        use_markup: false,
     });
     row.add_prefix(new Gtk.Image({
         icon_name: 'go-jump-symbolic',
@@ -549,20 +561,22 @@ function createExitNodesRow(exitNodes, connected) {
 
     if (exitNodes.length === 0) {
         row.add_row(new Adw.ActionRow({
-            title: 'No exit nodes available',
+            title: _('No exit nodes available'),
             subtitle: connected
-                ? 'No advertised default routes were reported by NetBird'
-                : 'Connect to NetBird to see exit nodes',
+                ? _('No advertised default routes were reported by NetBird')
+                : _('Connect to NetBird to see exit nodes'),
             activatable: false,
+            use_markup: false,
         }));
         return row;
     }
 
     for (const exitNode of exitNodes) {
         const child = new Adw.ActionRow({
-            title: exitNode.id || 'Exit Node',
+            title: exitNode.id || _('Exit Node'),
             subtitle: resourceSubtitle(exitNode),
             activatable: false,
+            use_markup: false,
         });
         child.add_prefix(new Gtk.Image({
             icon_name: exitNode.selected
@@ -581,18 +595,19 @@ function addConnectionWarningRow(page, connected) {
         return;
 
     addRow(page, createStatusRow(
-        'Connect to NetBird',
-        'Connect to NetBird to see networks and resources.',
+        _('Connect to NetBird'),
+        _('Connect to NetBird to see networks and resources.'),
         'dialog-warning-symbolic',
         true));
 }
 
 function createPeerRow(peer, connected) {
     const row = new Adw.ActionRow({
-        title: peer.name || 'Peer',
+        title: peer.name || _('Peer'),
         subtitle: [peer.ip, peer.status].filter(Boolean).join(' - '),
         activatable: false,
         sensitive: connected,
+        use_markup: false,
     });
     row.add_prefix(new Gtk.Image({
         icon_name: isConnectedStatus(peer.status)
@@ -605,10 +620,11 @@ function createPeerRow(peer, connected) {
 
 function createResourceRow(resource, state) {
     const row = new Adw.ActionRow({
-        title: resource.id || 'Resource',
+        title: resource.id || _('Resource'),
         subtitle: resourceSubtitle(resource),
         activatable: false,
         sensitive: state.connected,
+        use_markup: false,
     });
     row.add_prefix(new Gtk.Image({
         icon_name: resource.isExitNode ? 'go-jump-symbolic' : 'network-workgroup-symbolic',
@@ -618,28 +634,30 @@ function createResourceRow(resource, state) {
     const selectButton = new Gtk.Button({
         icon_name: 'object-select-symbolic',
         sensitive: state.connected,
-        tooltip_text: 'Select Resource',
+        tooltip_text: _('Select Resource'),
         valign: Gtk.Align.CENTER,
     });
+    setAccessibleLabel(selectButton, _('Select Resource'));
     selectButton.connect('clicked', () => {
         runResourceAction(
             state,
             {networkIds: [resource.id], select: true},
-            `Selected ${resource.id}`);
+            _('Selected %s').replace('%s', resource.id));
     });
     row.add_suffix(selectButton);
 
     const deselectButton = new Gtk.Button({
         icon_name: 'edit-delete-symbolic',
         sensitive: state.connected,
-        tooltip_text: 'Deselect Resource',
+        tooltip_text: _('Deselect Resource'),
         valign: Gtk.Align.CENTER,
     });
+    setAccessibleLabel(deselectButton, _('Deselect Resource'));
     deselectButton.connect('clicked', () => {
         runResourceAction(
             state,
             {networkIds: [resource.id], select: false},
-            `Deselected ${resource.id}`);
+            _('Deselected %s').replace('%s', resource.id));
     });
     row.add_suffix(deselectButton);
 
@@ -652,6 +670,7 @@ function createStatusRow(title, subtitle, iconName = 'network-workgroup-symbolic
         subtitle,
         activatable: false,
         sensitive,
+        use_markup: false,
     });
     row.add_prefix(new Gtk.Image({
         icon_name: iconName,
@@ -712,7 +731,7 @@ async function runConnectionAction(state, connect) {
                 timeoutMs: NETBIRD_COMMAND_TIMEOUT_MS,
             });
         }
-        showToast(state.window, connect ? 'NetBird connection started' : 'NetBird disconnected');
+        showToast(state.window, connect ? _('NetBird connection started') : _('NetBird disconnected'));
         state.connecting = false;
         await refreshAfterAction(state);
     } catch (error) {
@@ -761,16 +780,16 @@ function resourceSubtitle(resource) {
     if (resource.range)
         parts.push(resource.range);
     if (resource.resolved)
-        parts.push(`Resolved: ${resource.resolved}`);
+        parts.push(_('Resolved: %s').replace('%s', resource.resolved));
     if (resource.sourcePeer)
-        parts.push(`Peer: ${resource.sourcePeer}`);
+        parts.push(_('Peer: %s').replace('%s', resource.sourcePeer));
     if (resource.selected)
-        parts.push('Selected');
+        parts.push(_('Selected'));
     if (resource.overlapping)
-        parts.push('Overlapping');
+        parts.push(_('Overlapping'));
     if (resource.isExitNode)
-        parts.push('Exit node');
-    return parts.join(' - ') || 'No range or domain details';
+        parts.push(_('Exit node'));
+    return parts.join(' - ') || _('No range or domain details');
 }
 
 function clearRows(page) {
@@ -839,7 +858,11 @@ function cleanString(value) {
 
 function showToast(window, title) {
     if (typeof window.add_toast === 'function')
-        window.add_toast(new Adw.Toast({title}));
+        window.add_toast(new Adw.Toast({title, use_markup: false}));
+}
+
+function setAccessibleLabel(widget, label) {
+    widget.update_property([Gtk.AccessibleProperty.LABEL], [label]);
 }
 
 function formatError(error) {

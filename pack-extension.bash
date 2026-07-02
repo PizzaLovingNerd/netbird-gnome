@@ -10,6 +10,7 @@ sources=(
     api
     extensionErrors.js
     gtkProfileDialogs.js
+    i18n.js
     icons
     LICENSE
     networks-window.js

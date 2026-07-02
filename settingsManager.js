@@ -1,4 +1,5 @@
 import {SETTINGS_PAGES} from './settings.js';
+import {_} from './i18n.js';
 import {
     netbird_daemon_update,
     netbird_debug_bundle,
@@ -11,10 +12,27 @@ import {
 } from './api/index.js';
 
 
-export const GENERAL_PAGE_TITLE = 'General';
+export const GENERAL_PAGE_TITLE = _('General');
 const MASKED_PRESHARED_KEY = '**********';
 const NETBIRD_SETTINGS_TIMEOUT_MS = 30000;
 const NETBIRD_SETTINGS_QUERY_TIMEOUT_MS = 5000;
+const RECONNECT_REQUIRED_KEYS = new Set([
+    'allowSsh',
+    'blockInboundConnections',
+    'connectionQuantumResistance',
+    'disableClientRoutes',
+    'disableDns',
+    'disableLanAccess',
+    'disableServerRoutes',
+    'interfaceName',
+    'interfacePort',
+    'lazyConnections',
+    'managementUrl',
+    'mtu',
+    'networkMonitor',
+    'preSharedKey',
+    'quantumResistance',
+]);
 
 const ACTION_HANDLERS = {
     createDebugBundle: netbird_debug_bundle,
@@ -183,6 +201,14 @@ export class SettingsManager {
                 this._values.set(key, value);
             });
         }
+
+        if (!profileDirty)
+            return;
+
+        const needsReconnect = Array.from(appliedValues.keys())
+            .some(key => RECONNECT_REQUIRED_KEYS.has(key));
+        if (!needsReconnect)
+            return;
 
         const status = await netbird_status({
             timeoutMs: NETBIRD_SETTINGS_QUERY_TIMEOUT_MS,

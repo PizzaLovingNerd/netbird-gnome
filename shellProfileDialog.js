@@ -1,10 +1,13 @@
 import Clutter from 'gi://Clutter';
+import GObject from 'gi://GObject';
 import St from 'gi://St';
 
 import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
+import {gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 
-export class ProfileNameDialog extends ModalDialog.ModalDialog {
+export const ProfileNameDialog = GObject.registerClass(
+class ProfileNameDialog extends ModalDialog.ModalDialog {
     constructor({
         onAccept,
         onClose,
@@ -16,18 +19,18 @@ export class ProfileNameDialog extends ModalDialog.ModalDialog {
         this._closed = false;
 
         const title = new St.Label({
-            text: 'Add Profile',
+            text: _('Add Profile'),
             style_class: 'headline',
             x_align: Clutter.ActorAlign.CENTER,
         });
         const description = new St.Label({
-            text: 'Enter a name for the new NetBird profile.',
+            text: _('Enter a name for the new NetBird profile.'),
             style_class: 'dim-label',
             x_align: Clutter.ActorAlign.CENTER,
         });
         this._entry = new St.Entry({
             can_focus: true,
-            hint_text: 'Profile name',
+            hint_text: _('Profile name'),
             style_class: 'modal-dialog-entry',
             x_expand: true,
         });
@@ -40,12 +43,12 @@ export class ProfileNameDialog extends ModalDialog.ModalDialog {
         this._addButton = this.addButton({
             action: () => this._accept(),
             default: true,
-            label: 'Add',
+            label: _('Add'),
         });
         this.addButton({
             action: () => this.close(),
             key: Clutter.KEY_Escape,
-            label: 'Cancel',
+            label: _('Cancel'),
         });
         this._addButton.reactive = false;
         this._addButton.can_focus = false;
@@ -82,4 +85,4 @@ export class ProfileNameDialog extends ModalDialog.ModalDialog {
         this._onClose = null;
         super.destroy();
     }
-}
+});

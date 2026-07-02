@@ -1,4 +1,5 @@
 {
+  "gettext-domain": "netbird-gnome",
   "name": "NetBird for GNOME",
   "description": "NetBird Quick Setting for GNOME",
   "uuid": "gnome@netbird.io",

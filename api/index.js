@@ -6,11 +6,16 @@ export const DEFAULT_TIMEOUT_MS = 15000;
 
 const DEFAULT_NETBIRD_JSON_SOCKET = 'unix:///var/run/netbird-http.sock';
 const DEBUG_API_OUTPUT = false;
+const JSON_SOCKET_CACHE_TTL_US = 30000000;
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MIN_UNIX_SOCKET_AGE_US = 2000000;
 const SERVICE_PARAMS_PATHS = [
     '/var/lib/netbird/service.json',
     '/etc/netbird/service.json',
 ];
+
+let cachedJsonSocket = '';
+let cachedJsonSocketAtUs = -1;
 
 
 export function netbird_json_api_available() {
@@ -759,37 +764,75 @@ function writeAllAsync(stream, bytes, cancellable) {
 }
 
 function readHttpResponse(stream, cancellable) {
-    const responseBytes = [];
+    let buffer = new Uint8Array(8192);
+    let length = 0;
+    let scanned = 0;
     let headerEnd = -1;
     let contentLength = null;
+    let chunked = false;
 
     return new Promise((resolve, reject) => {
+        function append(bytes) {
+            if (length + bytes.length > buffer.length) {
+                const grown = new Uint8Array(
+                    Math.max(buffer.length * 2, length + bytes.length));
+                grown.set(buffer.subarray(0, length));
+                buffer = grown;
+            }
+            buffer.set(bytes, length);
+            length += bytes.length;
+        }
+
+        function response() {
+            return buffer.subarray(0, length);
+        }
+
+        function bodyComplete() {
+            if (headerEnd === -1)
+                return false;
+
+            const bodyStart = headerEnd + 4;
+            if (chunked)
+                return chunkedBodyComplete(buffer.subarray(bodyStart, length));
+
+            if (contentLength !== null)
+                return length - bodyStart >= contentLength;
+
+            return false;
+        }
+
         function readNext() {
             stream.read_bytes_async(4096, GLib.PRIORITY_DEFAULT, cancellable, (source, result) => {
                 try {
                     const bytes = source.read_bytes_finish(result);
                     if (bytes.get_size() === 0) {
-                        resolve(parseResponse(new Uint8Array(responseBytes)));
+                        if (headerEnd !== -1 && !bodyComplete())
+                            throw new Error('Truncated NetBird JSON API response');
+                        resolve(parseResponse(response()));
                         return;
                     }
 
-                    responseBytes.push(...bytes.toArray());
+                    append(bytes.toArray());
+                    if (length > MAX_RESPONSE_BYTES)
+                        throw new Error('NetBird JSON API response too large');
 
                     if (headerEnd === -1) {
-                        headerEnd = findHeaderEnd(responseBytes);
+                        headerEnd = findHeaderEnd(response(), scanned);
+                        scanned = Math.max(0, length - 3);
                         if (headerEnd !== -1) {
                             const headerText = new TextDecoder().decode(
-                                new Uint8Array(responseBytes.slice(0, headerEnd)));
+                                buffer.subarray(0, headerEnd));
                             contentLength = parseContentLength(headerText);
+                            chunked = Boolean(parseHeaders(headerText)
+                                .get('transfer-encoding')
+                                ?.toLowerCase()
+                                .includes('chunked'));
                         }
                     }
 
-                    if (headerEnd !== -1 && contentLength !== null) {
-                        const bodyLength = responseBytes.length - (headerEnd + 4);
-                        if (bodyLength >= contentLength) {
-                            resolve(parseResponse(new Uint8Array(responseBytes)));
-                            return;
-                        }
+                    if (bodyComplete()) {
+                        resolve(parseResponse(response()));
+                        return;
                     }
 
                     readNext();
@@ -803,8 +846,8 @@ function readHttpResponse(stream, cancellable) {
     });
 }
 
-function findHeaderEnd(bytes) {
-    for (let index = 0; index <= bytes.length - 4; index++) {
+function findHeaderEnd(bytes, start = 0) {
+    for (let index = start; index <= bytes.length - 4; index++) {
         if (bytes[index] === 13 &&
             bytes[index + 1] === 10 &&
             bytes[index + 2] === 13 &&
@@ -813,6 +856,43 @@ function findHeaderEnd(bytes) {
     }
 
     return -1;
+}
+
+function chunkedBodyComplete(body) {
+    let offset = 0;
+
+    while (offset < body.length) {
+        let lineEnd = -1;
+        for (let index = offset; index < body.length - 1; index++) {
+            if (body[index] === 13 && body[index + 1] === 10) {
+                lineEnd = index;
+                break;
+            }
+        }
+        if (lineEnd === -1)
+            return false;
+
+        const sizeText = new TextDecoder()
+            .decode(body.slice(offset, lineEnd))
+            .split(';')[0]
+            .trim();
+        if (!/^[0-9a-f]+$/i.test(sizeText))
+            return true;
+
+        const size = Number.parseInt(sizeText, 16);
+        offset = lineEnd + 2;
+        if (size === 0)
+            return findHeaderEnd(body, lineEnd) !== -1;
+
+        if (body.length < offset + size + 2)
+            return false;
+        offset += size;
+        if (body[offset] !== 13 || body[offset + 1] !== 10)
+            return true;
+        offset += 2;
+    }
+
+    return false;
 }
 
 function parseResponse(bytes) {
@@ -863,8 +943,12 @@ function parseContentLength(headerText) {
     if (!line)
         return null;
 
-    const value = Number(line.slice(line.indexOf(':') + 1).trim());
-    return Number.isFinite(value) ? value : null;
+    const text = line.slice(line.indexOf(':') + 1).trim();
+    if (!/^\d+$/.test(text))
+        return null;
+
+    const value = Number(text);
+    return Number.isSafeInteger(value) ? value : null;
 }
 
 function decodeChunkedBody(body) {
@@ -886,13 +970,16 @@ function decodeChunkedBody(body) {
             .decode(body.slice(offset, lineEnd))
             .split(';')[0]
             .trim();
-        const size = Number.parseInt(sizeText, 16);
-        if (!Number.isFinite(size))
+        if (!/^[0-9a-f]+$/i.test(sizeText))
             throw new Error('Invalid NetBird JSON API chunk size');
+        const size = Number.parseInt(sizeText, 16);
 
         offset = lineEnd + 2;
-        if (size === 0)
+        if (size === 0) {
+            if (findHeaderEnd(body, lineEnd) === -1)
+                throw new Error('Truncated NetBird JSON API chunk terminator');
             break;
+        }
         if (offset + size + 2 > body.length)
             throw new Error('Truncated NetBird JSON API chunk');
 
@@ -951,9 +1038,19 @@ function createConnectable(endpoint) {
 }
 
 function netbirdJsonSocket() {
-    return GLib.getenv('NETBIRD_JSON_SOCKET') ||
-        readConfiguredJsonSocket() ||
-        DEFAULT_NETBIRD_JSON_SOCKET;
+    const override = GLib.getenv('NETBIRD_JSON_SOCKET');
+    if (override)
+        return override;
+
+    const nowUs = GLib.get_monotonic_time();
+    if (cachedJsonSocketAtUs === -1 ||
+        nowUs - cachedJsonSocketAtUs >= JSON_SOCKET_CACHE_TTL_US) {
+        cachedJsonSocket = readConfiguredJsonSocket() ||
+            DEFAULT_NETBIRD_JSON_SOCKET;
+        cachedJsonSocketAtUs = nowUs;
+    }
+
+    return cachedJsonSocket;
 }
 
 function unixSocketIsStable(path) {

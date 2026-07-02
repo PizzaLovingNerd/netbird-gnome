@@ -1,6 +1,7 @@
 import Adw from 'gi://Adw?version=1';
 import Gtk from 'gi://Gtk?version=4.0';
 
+import {_} from './i18n.js';
 
 export function presentAlertDialog(dialog, parent) {
     if (parent) {
@@ -30,14 +31,15 @@ export function confirmProfileDeregister({
     onAccept,
 } = {}) {
     const dialog = new Adw.AlertDialog({
-        heading: 'Deregister Profile?',
-        body: `Sign out of "${profileName}" and remove this device from the NetBird management service.`,
+        heading: _('Deregister Profile?'),
+        body: _('Sign out of "%s" and remove this device from the NetBird management service.')
+            .replace('%s', profileName),
         close_response: 'cancel',
         default_response: 'cancel',
     });
 
-    dialog.add_response('cancel', 'Cancel');
-    dialog.add_response('deregister', 'Deregister');
+    dialog.add_response('cancel', _('Cancel'));
+    dialog.add_response('deregister', _('Deregister'));
     dialog.set_response_appearance('deregister', Adw.ResponseAppearance.DESTRUCTIVE);
 
     dialog.connect('response', (_source, response) => {
@@ -55,20 +57,20 @@ export function promptProfileName({
     onAccept,
 } = {}) {
     const entry = new Gtk.Entry({
-        placeholder_text: 'Profile name',
+        placeholder_text: _('Profile name'),
         activates_default: true,
     });
 
     const dialog = new Adw.AlertDialog({
-        heading: 'Add Profile',
-        body: 'Enter a name for the new NetBird profile.',
+        heading: _('Add Profile'),
+        body: _('Enter a name for the new NetBird profile.'),
         extra_child: entry,
         close_response: 'cancel',
         default_response: 'add',
     });
 
-    dialog.add_response('cancel', 'Cancel');
-    dialog.add_response('add', 'Add');
+    dialog.add_response('cancel', _('Cancel'));
+    dialog.add_response('add', _('Add'));
     dialog.set_response_appearance('add', Adw.ResponseAppearance.SUGGESTED);
     dialog.set_response_enabled('add', false);
 

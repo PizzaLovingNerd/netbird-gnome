@@ -123,6 +123,43 @@ const tests = [
             profileName: 'Work Profile',
             disableAutoConnect: true,
         }, {timeoutMs: TEST_TIMEOUT_MS})],
+    ['chunked response on keep-alive connection', () =>
+        withResponseMode('keep-alive', () =>
+            netbird_status({timeoutMs: TEST_TIMEOUT_MS}))],
+    ['chunked framing takes precedence over content length', () =>
+        withResponseMode('chunked-with-content-length', () =>
+            netbird_status({timeoutMs: TEST_TIMEOUT_MS}))],
+    ['non-JSON success body', async () => {
+        const result = await withResponseMode('non-json', () =>
+            netbird_debug_bundle({timeoutMs: TEST_TIMEOUT_MS}));
+        if (result.data !== null)
+            throw new Error('expected null data for a non-JSON response');
+    }],
+    ['truncated content-length response', () =>
+        assertRejectsResponseMode('truncated', 'Truncated NetBird JSON API response')],
+    ['malformed status line', () =>
+        assertRejectsResponseMode('malformed-status', 'status line')],
+    ['garbage response preamble', () =>
+        assertRejectsResponseMode('garbage-preamble', 'status line')],
+    ['oversized response', () =>
+        assertRejectsResponseMode('oversized', 'response too large', 5000)],
+    ['unframed keep-alive response times out', () =>
+        assertRejectsResponseMode('unframed-keep-alive', 'timed out', 100)],
+    ['strict content-length parsing', () =>
+        assertRejectsResponseMode('non-decimal-content-length', 'timed out', 100)],
+    ['malformed chunk size', () =>
+        assertRejectsResponseMode('malformed-chunk-size', 'chunk size')],
+    ['request timeout', async () => {
+        try {
+            await withResponseMode('timeout', () =>
+                netbird_debug_bundle({timeoutMs: 100}));
+        } catch (error) {
+            if (!error.timedOut || error.statusText !== 'Timeout')
+                throw new Error(`expected timeout metadata, got: ${error}`);
+            return;
+        }
+        throw new Error('expected request to time out');
+    }],
 ];
 
 
@@ -134,9 +171,28 @@ async function main() {
     try {
         for (const [name, test] of tests)
             await assertDoesNotThrow(name, test);
+
+        await assertDoesNotThrow('unix socket endpoint', testUnixSocketEndpoint);
     } finally {
         server.stop();
         GLib.unsetenv('NETBIRD_JSON_SOCKET');
+    }
+}
+
+async function testUnixSocketEndpoint() {
+    const socketPath = GLib.build_filenamev([
+        GLib.get_tmp_dir(),
+        `netbird-gnome-test-${GLib.uuid_string_random()}.sock`,
+    ]);
+    const server = new FakeNetBirdJsonServer();
+    server.startUnix(socketPath);
+    GLib.setenv('NETBIRD_JSON_SOCKET', `unix://${socketPath}`, true);
+
+    try {
+        await netbird_debug_bundle({timeoutMs: TEST_TIMEOUT_MS});
+    } finally {
+        server.stop();
+        GLib.unlink(socketPath);
     }
 }
 
@@ -203,11 +259,37 @@ function withCancellable() {
     };
 }
 
+async function withResponseMode(mode, callback) {
+    GLib.setenv('NETBIRD_FAKE_RESPONSE_MODE', mode, true);
+    try {
+        return await callback();
+    } finally {
+        GLib.unsetenv('NETBIRD_FAKE_RESPONSE_MODE');
+    }
+}
+
+async function assertRejectsResponseMode(mode, expectedMessage, timeoutMs = TEST_TIMEOUT_MS) {
+    try {
+        await withResponseMode(mode, () =>
+            netbird_debug_bundle({timeoutMs}));
+    } catch (error) {
+        if (!String(error).includes(expectedMessage))
+            throw new Error(`expected "${expectedMessage}" error, got: ${error}`);
+        return;
+    }
+
+    throw new Error(`expected ${mode} response to reject`);
+}
+
 class FakeNetBirdJsonServer {
     constructor() {
+        this._openConnections = [];
         this._service = new Gio.SocketService();
         this._service.connect('incoming', (_service, connection) => {
-            void this._handleConnection(connection);
+            void this._handleConnection(connection).catch(error => {
+                if (!error.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.BROKEN_PIPE))
+                    printerr(`fake server connection failed: ${error}`);
+            });
             return true;
         });
         this.port = 0;
@@ -218,23 +300,93 @@ class FakeNetBirdJsonServer {
         this._service.start();
     }
 
+    startUnix(path) {
+        this._service.add_address(
+            Gio.UnixSocketAddress.new(path),
+            Gio.SocketType.STREAM,
+            Gio.SocketProtocol.DEFAULT,
+            null);
+        this._service.start();
+    }
+
     stop() {
+        for (const connection of this._openConnections)
+            connection.close(null);
+        this._openConnections.length = 0;
         this._service.stop();
         this._service.close();
     }
 
     async _handleConnection(connection) {
+        let keepAlive = false;
         try {
             const request = await readHttpRequest(connection.get_input_stream());
             const response = this._dispatch(request);
-            await writeHttpResponse(connection.get_output_stream(), response);
+            keepAlive = Boolean(response.keepAlive);
+            if (!response.noResponse)
+                await writeHttpResponse(connection.get_output_stream(), response);
         } finally {
-            connection.close(null);
+            if (keepAlive)
+                this._openConnections.push(connection);
+            else
+                connection.close(null);
         }
     }
 
     _dispatch(request) {
         const method = request.path.split('/').pop();
+        const responseMode = GLib.getenv('NETBIRD_FAKE_RESPONSE_MODE');
+
+        if (responseMode === 'timeout')
+            return {keepAlive: true, noResponse: true};
+        if (responseMode === 'non-json')
+            return {body: 'not JSON', rawBody: true, statusCode: 200};
+        if (responseMode === 'truncated') {
+            return {
+                body: '{}',
+                contentLength: 3,
+                rawBody: true,
+                statusCode: 200,
+            };
+        }
+        if (responseMode === 'malformed-status')
+            return {body: '{}', rawBody: true, statusLine: 'HTTP/1.1 NOPE'};
+        if (responseMode === 'garbage-preamble')
+            return {body: '{}', rawBody: true, statusLine: 'garbage'};
+        if (responseMode === 'oversized') {
+            return {
+                body: 'x'.repeat((8 * 1024 * 1024) + 1),
+                rawBody: true,
+                statusCode: 200,
+            };
+        }
+        if (responseMode === 'unframed-keep-alive') {
+            return {
+                body: '{}',
+                keepAlive: true,
+                omitFraming: true,
+                rawBody: true,
+                statusCode: 200,
+            };
+        }
+        if (responseMode === 'non-decimal-content-length') {
+            return {
+                body: '{}',
+                contentLength: '0x10',
+                keepAlive: true,
+                rawBody: true,
+                statusCode: 200,
+            };
+        }
+        if (responseMode === 'malformed-chunk-size') {
+            return {
+                body: '{}',
+                chunked: true,
+                rawBody: true,
+                rawWireBody: '-5\r\n{}\r\n0\r\n\r\n',
+                statusCode: 200,
+            };
+        }
 
         if (method === 'Up' && GLib.getenv('NETBIRD_FAKE_LOGIN') === '1') {
             return {
@@ -254,7 +406,7 @@ class FakeNetBirdJsonServer {
                     statusCode: 200,
                 };
 
-            return {
+            const response = {
                 body: {
                     status: 'Connected',
                     fullStatus: {
@@ -266,6 +418,13 @@ class FakeNetBirdJsonServer {
                 chunked: true,
                 statusCode: 200,
             };
+            if (responseMode === 'keep-alive')
+                response.keepAlive = true;
+            if (responseMode === 'chunked-with-content-length') {
+                response.contentLength = 1;
+                response.keepAlive = true;
+            }
+            return response;
         }
 
         if (method === 'GetActiveProfile') {
@@ -427,39 +586,62 @@ function parseContentLength(headerText) {
 function writeHttpResponse(stream, {
     body,
     chunked = false,
-    statusCode,
+    contentLength = null,
+    omitFraming = false,
+    rawBody = false,
+    rawWireBody = null,
+    statusCode = 200,
+    statusLine = null,
 }) {
-    const responseBody = JSON.stringify(body);
+    const responseBody = rawBody ? body : JSON.stringify(body);
+    const responseBodyBytes = new TextEncoder().encode(responseBody);
     const reason = statusCode === 200 ? 'OK' : 'Error';
     const headers = [
-        `HTTP/1.1 ${statusCode} ${reason}`,
+        statusLine ?? `HTTP/1.1 ${statusCode} ${reason}`,
         'Content-Type: application/json',
-        'Connection: close',
     ];
     let wireBody = responseBody;
 
     if (chunked) {
         headers.push('Transfer-Encoding: chunked');
-        wireBody = `${responseBody.length.toString(16)}\r\n${responseBody}\r\n0\r\n\r\n`;
-    } else {
-        headers.push(`Content-Length: ${new TextEncoder().encode(responseBody).length}`);
-    }
+        wireBody = `${responseBodyBytes.length.toString(16)}\r\n${responseBody}\r\n0\r\n\r\n`;
+    } else if (!omitFraming)
+        headers.push(`Content-Length: ${contentLength ?? responseBodyBytes.length}`);
+
+    if (chunked && contentLength !== null)
+        headers.push(`Content-Length: ${contentLength}`);
+    if (rawWireBody !== null)
+        wireBody = rawWireBody;
 
     const response = `${headers.join('\r\n')}\r\n\r\n${wireBody}`;
 
+    const encoded = new TextEncoder().encode(response);
+    let offset = 0;
+
     return new Promise((resolve, reject) => {
-        stream.write_all_async(
-            new TextEncoder().encode(response),
-            GLib.PRIORITY_DEFAULT,
-            null,
-            (source, result) => {
-                try {
-                    source.write_all_finish(result);
-                    resolve();
-                } catch (error) {
-                    reject(error);
-                }
-            });
+        function writeNext() {
+            if (offset >= encoded.length) {
+                resolve();
+                return;
+            }
+
+            const chunk = encoded.slice(offset, offset + 65536);
+            stream.write_all_async(
+                chunk,
+                GLib.PRIORITY_DEFAULT,
+                null,
+                (source, result) => {
+                    try {
+                        source.write_all_finish(result);
+                        offset += chunk.length;
+                        writeNext();
+                    } catch (error) {
+                        reject(error);
+                    }
+                });
+        }
+
+        writeNext();
     });
 }
 
